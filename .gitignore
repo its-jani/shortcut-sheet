@@ -1,0 +1,22 @@
+# Rust build output (compilation artifacts)
+/target
+
+# Cargo lockfile override (keep Cargo.lock for binary projects, but ignore if needed)
+# For binary apps like shortcut-sheet, Cargo.lock IS usually committed, but /target must be ignored.
+
+# IDE / Editor configuration folders
+.vscode/
+.idea/
+*.rs.bk
+
+# OS-generated files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Temporary log files
+*.log
+
+/target/
+replica/tmp/
+**/*.rs.bk

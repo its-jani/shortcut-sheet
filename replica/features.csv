@@ -1,0 +1,34 @@
+feature,area,priority,original,clone,notes
+Global low-level keyboard hook detects a held modifier,overlay,must,yes,no,WH_KEYBOARD_LL; must reject injected input like the original does
+Hold-duration threshold before showing (default ~1000ms),overlay,must,yes,no,timing only; no key repeat spam
+Foreground process detection returns the active exe name,overlay,must,yes,no,GetForegroundWindow + GetWindowThreadProcessId + QueryFullProcessImageNameW
+exe name maps to a supported app profile,dataset,must,yes,no,case-insensitive; several exe names can map to one app
+Overlay lists that app's shortcuts grouped by collection,overlay,must,yes,no,S01
+Frameless always-on-top overlay centered on the foreground window,overlay,must,yes,no,not the screen; measured ~340x390
+Overlay never steals focus and focus restores cleanly,overlay,must,yes,no,WS_EX_NOACTIVATE | WS_EX_TOPMOST observed live
+Type-to-filter search across command names,overlay,must,yes,no,S01 search box
+Clicking or Enter on a row fires the real key combo into the app,overlay,must,yes,no,the payoff of the core loop
+Releasing the trigger key hides the overlay,overlay,must,yes,no
+User-editable JSON shortcut dataset,dataset,must,yes,no,our own file; schema in recon.md
+Keycap chips render modifiers and glyphs,overlay,must,yes,no,CTRL as word; Shift as glyph
+Tray icon; resident with no taskbar button,shell,must,yes,no,original uses H.NotifyIcon
+Light and dark theme following the system,shell,must,yes,no,both observed in vendor shot
+Practice hub: app grid grouped by category,practice,should,yes,no,S02
+App detail page with collections and mastered counts,practice,should,yes,no,S04
+Timed drill: type the combo within 2s to master it,practice,should,yes,no,S05
+learnt/mastered progress persisted per app+collection,practice,should,yes,no,format observed in the user's own LearningData json
+Configurable trigger hotkey and hold duration,settings,should,yes,no,documented by the vendor README
+Run on startup toggle,settings,should,yes,no,HKCU Run key instead of MSIX startup task
+Overlay opacity and max-height settings,settings,should,yes,no,inferred; not observed on the original
+Keyboard navigation of overlay rows with arrows and Enter,overlay,should,yes,no,needed for the accessibility claim
+Skip-for-now and shuffle in the drill,practice,could,yes,no
+Streaks and level-up summary,practice,could,yes,no,their gamification branding stays out
+Import the MIT-licensed upstream shortcut dataset with attribution,dataset,could,yes,no,facts are MIT; curation is not
+Per-monitor placement and full DPI awareness,multi-monitor,could,yes,no,original is PerMonitorV2
+Export and import all user data as one folder,backup,could,yes,no
+Fuzzy search matching command aliases,search,could,yes,no
+Vendor's collection naming ordering and curation,dataset,skip,yes,skip,their editorial work; shortcut-sheet writes its own
+Third-party app logos and names as shipped assets,branding,skip,yes,skip,trademarks of the app vendors; generic letter tiles instead
+Trial purchase and redemption-code licensing,licensing,skip,yes,skip,their commerce; the clone is free and open source
+MSIX and WindowsAppSDK packaging,packaging,skip,yes,skip,replaced by a portable exe
+Full screen-reader automation-peer parity,accessibility,skip,yes,skip,basic keyboard operability only

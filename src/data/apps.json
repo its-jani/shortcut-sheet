@@ -1,0 +1,314 @@
+[
+  {
+    "name": "Visual Studio Code",
+    "category": "Development & Coding",
+    "exe": ["code.exe", "code-insiders.exe"],
+    "collections": [
+      {
+        "name": "Everyday",
+        "shortcuts": [
+          { "command": "New file", "keys": "Ctrl+N" },
+          { "command": "Open file", "keys": "Ctrl+O" },
+          { "command": "Save", "keys": "Ctrl+S" },
+          { "command": "Close editor", "keys": "Ctrl+W" },
+          { "command": "Undo", "keys": "Ctrl+Z" },
+          { "command": "Redo", "keys": "Ctrl+Y" },
+          { "command": "Cut", "keys": "Ctrl+X" },
+          { "command": "Copy", "keys": "Ctrl+C" },
+          { "command": "Paste", "keys": "Ctrl+V" },
+          { "command": "Find", "keys": "Ctrl+F" },
+          { "command": "Replace", "keys": "Ctrl+H" },
+          { "command": "Command palette", "keys": "Ctrl+Shift+P" },
+          { "command": "Quick open file", "keys": "Ctrl+P" },
+          { "command": "Toggle integrated terminal", "keys": "Ctrl+Grave" },
+          { "command": "Toggle sidebar", "keys": "Ctrl+B" }
+        ]
+      },
+      {
+        "name": "Editing text",
+        "shortcuts": [
+          { "command": "Copy line up", "keys": "Shift+Alt+Up" },
+          { "command": "Copy line down", "keys": "Shift+Alt+Down" },
+          { "command": "Move line up", "keys": "Alt+Up" },
+          { "command": "Move line down", "keys": "Alt+Down" },
+          { "command": "Delete line", "keys": "Ctrl+Shift+K" },
+          { "command": "Toggle line comment", "keys": "Ctrl+Slash" },
+          { "command": "Toggle block comment", "keys": "Shift+Alt+A" },
+          { "command": "Format document", "keys": "Shift+Alt+F" },
+          { "command": "Add next occurrence to selection", "keys": "Ctrl+D" },
+          { "command": "Select all occurrences", "keys": "Ctrl+Shift+L" },
+          { "command": "Select line", "keys": "Ctrl+L" },
+          { "command": "Expand selection", "keys": "Ctrl+Shift+BracketClose" },
+          { "command": "Shrink selection", "keys": "Ctrl+Shift+BracketOpen" },
+          { "command": "Fold region", "keys": "Ctrl+Shift+BracketOpen" },
+          { "command": "Unfold region", "keys": "Ctrl+Shift+BracketClose" },
+          { "command": "Indent", "keys": "Tab" },
+          { "command": "Outdent", "keys": "Shift+Tab" }
+        ]
+      },
+      {
+        "name": "Going places",
+        "shortcuts": [
+          { "command": "Go to line", "keys": "Ctrl+G" },
+          { "command": "Go to definition", "keys": "F12" },
+          { "command": "Peek definition", "keys": "Alt+F12" },
+          { "command": "Go to symbol", "keys": "Ctrl+Shift+O" },
+          { "command": "Go back", "keys": "Alt+Left" },
+          { "command": "Go forward", "keys": "Alt+Right" },
+          { "command": "Scroll line up", "keys": "Ctrl+Up" },
+          { "command": "Scroll line down", "keys": "Ctrl+Down" },
+          { "command": "Go to beginning of file", "keys": "Ctrl+Home" },
+          { "command": "Go to end of file", "keys": "Ctrl+End" },
+          { "command": "Next problem", "keys": "F8" },
+          { "command": "Rename symbol", "keys": "F2" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "Google Chrome",
+    "category": "Browsers & Internet",
+    "exe": ["chrome.exe", "chrome_beta.exe", "chrome_dev.exe"],
+    "collections": [
+      {
+        "name": "Tabs and windows",
+        "shortcuts": [
+          { "command": "New tab", "keys": "Ctrl+T" },
+          { "command": "New window", "keys": "Ctrl+N" },
+          { "command": "New incognito window", "keys": "Ctrl+Shift+N" },
+          { "command": "Close tab", "keys": "Ctrl+W" },
+          { "command": "Reopen closed tab", "keys": "Ctrl+Shift+T" },
+          { "command": "Next tab", "keys": "Ctrl+Tab" },
+          { "command": "Previous tab", "keys": "Ctrl+Shift+Tab" },
+          { "command": "Switch to tab 1", "keys": "Ctrl+1" },
+          { "command": "Switch to tab 2", "keys": "Ctrl+2" },
+          { "command": "Switch to tab 3", "keys": "Ctrl+3" },
+          { "command": "Switch to last tab", "keys": "Ctrl+9" }
+        ]
+      },
+      {
+        "name": "Page and address",
+        "shortcuts": [
+          { "command": "Focus address bar", "keys": "Ctrl+L" },
+          { "command": "Find in page", "keys": "Ctrl+F" },
+          { "command": "Reload", "keys": "Ctrl+R" },
+          { "command": "Hard reload", "keys": "Ctrl+Shift+R" },
+          { "command": "Go home", "keys": "Alt+Home" },
+          { "command": "Back", "keys": "Alt+Left" },
+          { "command": "Forward", "keys": "Alt+Right" },
+          { "command": "View source", "keys": "Ctrl+U" },
+          { "command": "Developer tools", "keys": "Ctrl+Shift+I" },
+          { "command": "Print", "keys": "Ctrl+P" },
+          { "command": "Save page", "keys": "Ctrl+S" },
+          { "command": "Downloads", "keys": "Ctrl+J" },
+          { "command": "History", "keys": "Ctrl+H" },
+          { "command": "Clear browsing data", "keys": "Ctrl+Shift+Delete" },
+          { "command": "Bookmarks bar", "keys": "Ctrl+Shift+B" },
+          { "command": "Full screen", "keys": "F11" },
+          { "command": "Zoom in", "keys": "Ctrl+Equals" },
+          { "command": "Zoom out", "keys": "Ctrl+Minus" },
+          { "command": "Reset zoom", "keys": "Ctrl+0" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "Brave",
+    "category": "Browsers & Internet",
+    "exe": ["brave.exe"],
+    "collections": [
+      {
+        "name": "Tabs and windows",
+        "shortcuts": [
+          { "command": "New tab", "keys": "Ctrl+T" },
+          { "command": "New window", "keys": "Ctrl+N" },
+          { "command": "New private window", "keys": "Ctrl+Shift+N" },
+          { "command": "Close tab", "keys": "Ctrl+W" },
+          { "command": "Reopen closed tab", "keys": "Ctrl+Shift+T" },
+          { "command": "Next tab", "keys": "Ctrl+Tab" },
+          { "command": "Previous tab", "keys": "Ctrl+Shift+Tab" }
+        ]
+      },
+      {
+        "name": "Page and address",
+        "shortcuts": [
+          { "command": "Focus address bar", "keys": "Ctrl+L" },
+          { "command": "Find in page", "keys": "Ctrl+F" },
+          { "command": "Reload", "keys": "Ctrl+R" },
+          { "command": "Hard reload", "keys": "Ctrl+Shift+R" },
+          { "command": "Back", "keys": "Alt+Left" },
+          { "command": "Forward", "keys": "Alt+Right" },
+          { "command": "Developer tools", "keys": "Ctrl+Shift+I" },
+          { "command": "Print", "keys": "Ctrl+P" },
+          { "command": "History", "keys": "Ctrl+H" },
+          { "command": "Downloads", "keys": "Ctrl+J" },
+          { "command": "Clear browsing data", "keys": "Ctrl+Shift+Delete" },
+          { "command": "Full screen", "keys": "F11" },
+          { "command": "Zoom in", "keys": "Ctrl+Equals" },
+          { "command": "Zoom out", "keys": "Ctrl+Minus" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "Mozilla Firefox",
+    "category": "Browsers & Internet",
+    "exe": ["firefox.exe"],
+    "collections": [
+      {
+        "name": "Tabs and windows",
+        "shortcuts": [
+          { "command": "New tab", "keys": "Ctrl+T" },
+          { "command": "New window", "keys": "Ctrl+N" },
+          { "command": "New private window", "keys": "Ctrl+Shift+P" },
+          { "command": "Close tab", "keys": "Ctrl+W" },
+          { "command": "Reopen closed tab", "keys": "Ctrl+Shift+T" },
+          { "command": "Next tab", "keys": "Ctrl+Tab" },
+          { "command": "Previous tab", "keys": "Ctrl+Shift+Tab" }
+        ]
+      },
+      {
+        "name": "Page and address",
+        "shortcuts": [
+          { "command": "Focus address bar", "keys": "Ctrl+L" },
+          { "command": "Find in page", "keys": "Ctrl+F" },
+          { "command": "Reload", "keys": "Ctrl+R" },
+          { "command": "Force reload", "keys": "Ctrl+Shift+R" },
+          { "command": "Stop loading", "keys": "Escape" },
+          { "command": "Back", "keys": "Alt+Left" },
+          { "command": "Forward", "keys": "Alt+Right" },
+          { "command": "Bookmark this page", "keys": "Ctrl+D" },
+          { "command": "Library of bookmarks", "keys": "Ctrl+Shift+B" },
+          { "command": "Developer tools", "keys": "F12" },
+          { "command": "Browser console", "keys": "Ctrl+Shift+J" },
+          { "command": "Print", "keys": "Ctrl+P" },
+          { "command": "History", "keys": "Ctrl+H" },
+          { "command": "Downloads", "keys": "Ctrl+J" },
+          { "command": "Full screen", "keys": "F11" },
+          { "command": "Zoom in", "keys": "Ctrl+Equals" },
+          { "command": "Zoom out", "keys": "Ctrl+Minus" },
+          { "command": "Reset zoom", "keys": "Ctrl+0" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "File Explorer",
+    "category": "System & Miscellaneous",
+    "exe": ["explorer.exe"],
+    "collections": [
+      {
+        "name": "Files",
+        "shortcuts": [
+          { "command": "Open", "keys": "Enter" },
+          { "command": "Rename", "keys": "F2" },
+          { "command": "Copy", "keys": "Ctrl+C" },
+          { "command": "Cut", "keys": "Ctrl+X" },
+          { "command": "Paste", "keys": "Ctrl+V" },
+          { "command": "Delete", "keys": "Delete" },
+          { "command": "Delete without the recycle bin", "keys": "Shift+Delete" },
+          { "command": "Create a folder", "keys": "Ctrl+Shift+N" },
+          { "command": "Select all", "keys": "Ctrl+A" },
+          { "command": "Undo", "keys": "Ctrl+Z" },
+          { "command": "Redo", "keys": "Ctrl+Y" },
+          { "command": "Properties", "keys": "Alt+Enter" },
+          { "command": "Copy path", "keys": "Ctrl+Shift+C" }
+        ]
+      },
+      {
+        "name": "Windows and panes",
+        "shortcuts": [
+          { "command": "New tab", "keys": "Ctrl+T" },
+          { "command": "Close tab", "keys": "Ctrl+W" },
+          { "command": "Go up one folder", "keys": "Alt+Up" },
+          { "command": "Back", "keys": "Alt+Left" },
+          { "command": "Forward", "keys": "Alt+Right" },
+          { "command": "Refresh", "keys": "F5" },
+          { "command": "Edit the address bar", "keys": "Alt+D" },
+          { "command": "Search", "keys": "Ctrl+E" },
+          { "command": "Details pane", "keys": "Alt+Shift+P" },
+          { "command": "Preview pane", "keys": "Alt+P" },
+          { "command": "Navigation pane", "keys": "Alt+Shift+N" },
+          { "command": "New window", "keys": "Ctrl+N" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "Windows Terminal",
+    "category": "Utilities & Tools",
+    "exe": ["wt.exe", "windowsterminal.exe"],
+    "collections": [
+      {
+        "name": "Tabs and panes",
+        "shortcuts": [
+          { "command": "New tab", "keys": "Ctrl+Shift+T" },
+          { "command": "Close tab", "keys": "Ctrl+Shift+W" },
+          { "command": "Next tab", "keys": "Ctrl+Tab" },
+          { "command": "Previous tab", "keys": "Ctrl+Shift+Tab" },
+          { "command": "Split pane horizontally", "keys": "Alt+Shift+Minus" },
+          { "command": "Split pane vertically", "keys": "Alt+Shift+Equals" },
+          { "command": "Move focus left", "keys": "Alt+Left" },
+          { "command": "Move focus right", "keys": "Alt+Right" },
+          { "command": "Move focus up", "keys": "Alt+Up" },
+          { "command": "Move focus down", "keys": "Alt+Down" },
+          { "command": "Rename tab", "keys": "Ctrl+Shift+Comma" }
+        ]
+      },
+      {
+        "name": "Clipboard and view",
+        "shortcuts": [
+          { "command": "Copy", "keys": "Ctrl+Shift+C" },
+          { "command": "Paste", "keys": "Ctrl+Shift+V" },
+          { "command": "Select all", "keys": "Ctrl+Shift+A" },
+          { "command": "Find", "keys": "Ctrl+Shift+F" },
+          { "command": "Command palette", "keys": "Ctrl+Shift+P" },
+          { "command": "Settings", "keys": "Ctrl+Comma" },
+          { "command": "Full screen", "keys": "Alt+Enter" },
+          { "command": "Toggle opacity", "keys": "Ctrl+Alt+Equals" },
+          { "command": "Clear buffer", "keys": "Ctrl+Shift+Delete" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "Adobe Photoshop",
+    "category": "Graphics & Design",
+    "exe": ["photoshop.exe"],
+    "collections": [
+      {
+        "name": "Edit",
+        "shortcuts": [
+          { "command": "Undo", "keys": "Ctrl+Z" },
+          { "command": "Cut", "keys": "Ctrl+X" },
+          { "command": "Copy", "keys": "Ctrl+C" },
+          { "command": "Copy merged", "keys": "Ctrl+Shift+C" },
+          { "command": "Paste", "keys": "Ctrl+V" },
+          { "command": "Select all", "keys": "Ctrl+A" },
+          { "command": "Deselect", "keys": "Ctrl+D" },
+          { "command": "Reselect", "keys": "Ctrl+Shift+D" },
+          { "command": "Invert selection", "keys": "Ctrl+I" },
+          { "command": "Free transform", "keys": "Ctrl+T" },
+          { "command": "Fill", "keys": "Shift+F5" },
+          { "command": "Save", "keys": "Ctrl+S" }
+        ]
+      },
+      {
+        "name": "Layers and view",
+        "shortcuts": [
+          { "command": "New layer", "keys": "Ctrl+Shift+N" },
+          { "command": "Duplicate layer", "keys": "Ctrl+J" },
+          { "command": "Merge visible", "keys": "Ctrl+Shift+E" },
+          { "command": "Delete layer", "keys": "Shift+Delete" },
+          { "command": "Fit on screen", "keys": "Ctrl+0" },
+          { "command": "Zoom to 100 percent", "keys": "Ctrl+1" },
+          { "command": "Zoom in", "keys": "Ctrl+Equals" },
+          { "command": "Zoom out", "keys": "Ctrl+Minus" },
+          { "command": "Smaller brush", "keys": "BracketOpen" },
+          { "command": "Bigger brush", "keys": "BracketClose" },
+          { "command": "Hide extras", "keys": "Ctrl+H" }
+        ]
+      }
+    ]
+  }
+]
