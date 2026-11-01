@@ -277,9 +277,7 @@ pub struct Catalog {
     pub apps: Vec<AppProfile>,
     by_exe: HashMap<String, usize>,
     pub settings: Settings,
-    /// Read by the overlay and the hub in the UI pass; the paint code has no business owning
-    /// wording, so it comes from here instead.
-    #[allow(dead_code)]
+    /// The words the interface says, read by the overlay on every frame it paints.
     pub strings: Strings,
     /// Profiles with no rows yet. Detection reads them in the engine pass; until then they
     /// are carried, not ignored, so the roster the target loads is on disk in one place.

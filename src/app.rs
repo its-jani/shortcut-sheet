@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::data::{Catalog, Combo};
+use crate::data::{Catalog, Combo, Theme};
 use crate::detect::{self, Context};
 use crate::platform::{self, HookEvent, TargetWindow, TrayEvent};
 use crate::ui::overlay::{Action, KeyFlags, Overlay};
@@ -33,6 +33,8 @@ pub struct Sheet {
     hwnd: Option<isize>,
     /// So "the window is not there yet" is said once per run, not once per frame.
     warned_no_hwnd: bool,
+    /// egui's widget visuals have been synced to the palette at least once.
+    styled: bool,
     palette: Palette,
     dark: bool,
     last_fire: Option<Instant>,
@@ -67,10 +69,23 @@ impl Sheet {
             target_exe: None,
             hwnd: None,
             warned_no_hwnd: false,
+            styled: false,
             palette: if dark { uitok::DARK } else { uitok::LIGHT },
             dark,
             last_fire: None,
             stats: Stats::default(),
+        }
+    }
+
+    /// Which palette to paint with: the user's override when `settings.json` names one, the
+    /// OS app mode otherwise. `Theme::System` is the default, so the override branch is the
+    /// only way this ever deviates from the desktop - and reading the field here is what makes
+    /// it a setting rather than a string in a file (BUG-010 had four of those).
+    fn wants_dark(&self) -> bool {
+        match self.catalog.settings.theme {
+            Theme::Light => false,
+            Theme::Dark => true,
+            Theme::System => detect_system_dark(),
         }
     }
 
@@ -181,7 +196,15 @@ impl Sheet {
         }
         self.stats.shows += 1;
         match platform::foreground_window() {
-            Some(target) => self.place_and_show(ctx, target),
+            Some(target) => {
+                // Recorded, which `on_show` also does and this path did not. Without it, Escape
+                // out of a focused search box closes the panel and leaves the caret nowhere: the
+                // hand-back has no saved window to give it to, and "clean focus restoration" -
+                // the one thing the overlay promises - could not be measured at all, because the
+                // hook that normally sets `target` ignores injected input by design.
+                self.target = Some(target);
+                self.place_and_show(ctx, target);
+            }
             None => {
                 let panel = self.panel_size();
                 self.show_at(ctx, panel, egui::pos2(80.0, 80.0));
@@ -312,12 +335,20 @@ impl eframe::App for Sheet {
                 return;
             }
         }
-        // Theme follows the OS, cheaply: only re-read while hidden.
+        // Theme follows the OS unless the settings file says otherwise, and cheaply: only
+        // re-read while hidden.
         if !self.overlay.is_open() {
-            let want_dark = detect_system_dark();
-            if want_dark != self.dark {
+            let want_dark = self.wants_dark();
+            if want_dark != self.dark || !self.styled {
                 self.dark = want_dark;
                 self.palette = if want_dark { uitok::DARK } else { uitok::LIGHT };
+                self.styled = true;
+                // egui's own widget visuals - the text-edit field, the selection, the
+                // scrollbars - are a separate system from the token palette and default to
+                // egui's colours. Left unsynced, the light theme drew a near-black search box
+                // on a white panel. Applied on the first frame and on every flip, not per
+                // frame, because set_visuals invalidates nothing but is not free.
+                ctx.set_visuals(uitok::visuals(&self.palette, want_dark));
             }
             if let Some(app) = self.peek.take() {
                 self.peek_show(&ctx, &app);
@@ -351,11 +382,13 @@ impl eframe::App for Sheet {
                 self.overlay.focused = true;
                 self.ensure_hwnd();
                 if let Some(h) = self.hwnd {
+                    tracing::debug!(hwnd = h, "overlay takes focus for the search box");
                     platform::activate(h);
                 }
             }
             Action::GiveUpFocus => {
                 self.overlay.focused = false;
+                tracing::debug!("overlay hands focus back and hides");
                 self.restore_focus();
                 self.on_hide(&ctx);
             }

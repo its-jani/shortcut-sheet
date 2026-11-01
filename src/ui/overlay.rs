@@ -1,10 +1,14 @@
 //! S01 - the cheat-sheet overlay.
+//!
+//! Nothing in here hardcodes a colour, a size or a word: the palette and the metrics come
+//! from `crate::ui` (mirroring `replica/design/tokens.json`) and the wording comes from
+//! `Catalog::strings` (mirroring `src/data/apps.json`).
 
-use egui::{Align, Color32, Layout, Pos2, ScrollArea, Sense, Stroke, Ui, Vec2};
+use egui::{Align, Color32, Layout, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, Vec2};
 
-use crate::data::{AppProfile, Catalog, Combo};
+use crate::data::{AppProfile, Catalog, Combo, Strings};
 use crate::detect;
-use crate::ui::{font, hover_fill, keycap, radius, rank, size, Palette};
+use crate::ui::{font, hover_fill, keycap, keycap_width, radius, rank, size, Palette};
 
 /// What the overlay decided during this frame.
 #[derive(Debug, PartialEq)]
@@ -154,10 +158,11 @@ impl Overlay {
 
         frame.show(ui, |ui| {
             ui.set_width(size::OVERLAY_WIDTH - size::PADDING * 2.0);
+            let s = &catalog.strings;
             self.title_bar(ui, p, app, &mut action);
-            self.search_bar(ui, p, app, &mut action);
-            ui.add_space(6.0);
-            self.list(ui, p, app, &mut action);
+            self.search_bar(ui, p, s, &mut action);
+            ui.add_space(size::SECTION_GAP - 4.0);
+            self.list(ui, p, s, app, &mut action);
         });
 
         // Re-filter only when the text actually changed, so we do not rebuild every frame.
@@ -171,49 +176,89 @@ impl Overlay {
         action
     }
 
+    /// The panel's own header: which app the sheet is about, and the way out. Drawn at the
+    /// measured 36 logical px so the row underneath always starts where the token says it does.
     fn title_bar(&mut self, ui: &mut Ui, p: &Palette, app: &AppProfile, action: &mut Action) {
-        ui.horizontal(|ui| {
-            crate::ui::letter_avatar(ui, &app.name, p, 16.0);
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(&app.name)
-                    .font(font::title())
-                    .color(p.text_primary),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                // Drawn, not a glyph. egui's bundled fonts have no U+2715 MULTIPLICATION X,
-                // so a text close button renders as tofu - and a symbol that only appears
-                // when the font happens to have it is not a symbol, it is a coincidence.
-                let (rect, x) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-                let c = rect.center();
-                let arm = 4.0;
-                let tint = if x.hovered() { p.text_primary } else { p.text_tertiary };
-                let stroke = egui::Stroke::new(1.2, tint);
-                let painter = ui.painter();
-                painter.line_segment(
-                    [c - egui::vec2(arm, arm), c + egui::vec2(arm, arm)],
-                    stroke,
+        let (bar, _) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), size::TITLE_BAR_HEIGHT),
+            Sense::hover(),
+        );
+        // egui 0.37's UiBuilder has no `vertically_centered`, so the band is centred by giving
+        // the scope a row that is already as tall as its content - the measured 36 px is what
+        // the band reserves, and this is what puts the avatar and the name in the middle of it.
+        let row = Rect::from_min_max(
+            Pos2::new(bar.min.x, bar.center().y - 10.0),
+            Pos2::new(bar.max.x, bar.center().y + 10.0),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                crate::ui::letter_avatar(ui, &app.name, p, 16.0);
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(&app.name)
+                        .font(font::title())
+                        .color(p.text_primary),
                 );
-                painter.line_segment(
-                    [c + egui::vec2(arm, -arm), c - egui::vec2(arm, -arm)],
-                    stroke,
-                );
-                if x.clicked() {
-                    *action = Action::GiveUpFocus;
-                }
-            });
-        });
-        ui.add_space(6.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Drawn, not a glyph. egui's bundled fonts have no U+2715 MULTIPLICATION X,
+                    // so a text close button renders as tofu - and a symbol that only appears
+                    // when the font happens to have it is not a symbol, it is a coincidence.
+                    let (rect, x) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+                    let c = rect.center();
+                    let arm = 4.0;
+                    let tint = if x.hovered() { p.text_primary } else { p.text_tertiary };
+                    let stroke = egui::Stroke::new(1.2, tint);
+                    let painter = ui.painter();
+                    painter.line_segment(
+                        [c - egui::vec2(arm, arm), c + egui::vec2(arm, arm)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [c + egui::vec2(arm, -arm), c - egui::vec2(arm, -arm)],
+                        stroke,
+                    );
+                    if x.clicked() {
+                        *action = Action::GiveUpFocus;
+                    }
+                });
+            },
+        );
+        ui.add_space(2.0);
     }
 
-    fn search_bar(&mut self, ui: &mut Ui, p: &Palette, app: &AppProfile, action: &mut Action) {
-        let te = egui::TextEdit::singleline(&mut self.query)
-            .hint_text("Search")
-            .font(font::command())
-            .text_color(p.text_primary)
-            .desired_width(ui.available_width() - 18.0)
-            .align(egui::Align2::LEFT_CENTER);
-        let resp = ui.add(te);
+    /// The search box, painted the way it is measured: a recessed field with a rule under it,
+    /// a magnifier at the right end, and no outline anywhere else. The field is darker than the
+    /// panel (`field` #1F1F1F on `surface` #1F1F1F in the overlay, #1F1F1F on #222222 in the
+    /// hub), which is the opposite of the raised white box egui draws by default.
+    fn search_bar(&mut self, ui: &mut Ui, p: &Palette, s: &Strings, action: &mut Action) {
+        let width = ui.available_width();
+        let (box_rect, _) =
+            ui.allocate_exact_size(Vec2::new(width, size::SEARCH_HEIGHT), Sense::hover());
+        // Leave the bottom 2 px for the rule so the box and the rule never overlap.
+        let field = Rect::from_min_max(box_rect.min, Pos2::new(box_rect.max.x, box_rect.max.y - 2.0));
+        ui.painter().rect_filled(field, radius::FIELD, p.field);
+
+        let icon_side = 14.0;
+        let icon_center = Pos2::new(field.max.x - icon_side, field.center().y);
+        draw_magnifier(ui.painter(), icon_center, icon_side * 0.42, p.text_tertiary);
+
+        let text_rect = Rect::from_min_max(
+            Pos2::new(field.min.x + 6.0, field.min.y),
+            Pos2::new(field.max.x - icon_side * 2.0, field.max.y),
+        );
+        let resp = ui.put(
+            text_rect,
+            egui::TextEdit::singleline(&mut self.query)
+                .hint_text(&s.overlay_search_placeholder)
+                .font(font::command())
+                .text_color(p.text_primary)
+                .desired_width(text_rect.width())
+                .align(egui::Align2::LEFT_CENTER),
+        );
 
         // Click into the field: the one deliberate focus change in the product.
         if resp.clicked() && !self.focused {
@@ -224,17 +269,17 @@ impl Overlay {
         }
 
         let active = self.focused || resp.has_focus();
-        let w = resp.rect.width().max(1.0);
-        let y = resp.rect.bottom() + 2.0;
+        let y = field.max.y + 1.0;
         ui.painter().line_segment(
-            [Pos2::new(resp.rect.min.x, y), Pos2::new(resp.rect.min.x + w, y)],
-            Stroke::new(if active { 2.0 } else { 1.0 }, if active { p.accent } else { p.border_strong }),
+            [Pos2::new(field.min.x, y), Pos2::new(field.max.x, y)],
+            Stroke::new(
+                if active { size::STROKE_FOCUS } else { size::STROKE_HAIRLINE },
+                if active { p.accent } else { p.border_strong },
+            ),
         );
-        ui.add_space(8.0);
-        let _ = app;
     }
 
-    fn list(&mut self, ui: &mut Ui, p: &Palette, app: &AppProfile, action: &mut Action) {
+    fn list(&mut self, ui: &mut Ui, p: &Palette, s: &Strings, app: &AppProfile, action: &mut Action) {
         let hover = hover_fill(p);
 
         ScrollArea::vertical()
@@ -255,17 +300,17 @@ impl Overlay {
                     ui.vertical_centered(|ui| {
                         ui.label(
                             egui::RichText::new(if self.query.is_empty() {
-                                "No shortcuts listed for this app yet"
+                                &s.overlay_empty
                             } else {
-                                "Nothing matches that search"
+                                &s.overlay_no_match
                             })
                             .font(font::command())
                             .color(p.text_secondary),
                         );
                         if !self.query.is_empty() {
                             ui.label(
-                                egui::RichText::new("Add your own in apps.json")
-                                    .font(font::header())
+                                egui::RichText::new(&s.overlay_no_match_hint)
+                                    .font(font::caption())
                                     .color(p.text_tertiary),
                             );
                         }
@@ -279,12 +324,19 @@ impl Overlay {
                     if Some(row.collection) != last_collection {
                         last_collection = Some(row.collection);
                         ui.add_space(if idx == 0 { 0.0 } else { size::SECTION_GAP });
-                        ui.label(
-                            egui::RichText::new(&app.collections[row.collection].name)
-                                .font(font::header())
-                                .color(p.text_secondary),
+                        // Painted, not laid out: a section header is static text, and asking
+                        // egui to reserve the measured 25 px band is the whole requirement.
+                        let (header, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), size::COLLECTION_HEADER_HEIGHT),
+                            Sense::hover(),
                         );
-                        ui.add_space(2.0);
+                        ui.painter().text(
+                            Pos2::new(header.min.x, header.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &app.collections[row.collection].name,
+                            font::header(),
+                            p.text_secondary,
+                        );
                     }
                     self.draw_row(ui, p, hover, row, idx, action);
                 }
@@ -378,11 +430,26 @@ pub struct KeyFlags {
     pub escape: bool,
 }
 
-/// Cheap width model so the name column truncates before the keycaps are drawn.
+/// The magnifier that sits at the right end of the search field. Drawn rather than typed:
+/// egui's bundled fonts have no reliable glyph for it, and a search box whose icon depends on
+/// a font fallback is a search box with a missing icon.
+fn draw_magnifier(painter: &egui::Painter, center: Pos2, radius_px: f32, color: Color32) {
+    let stroke = Stroke::new(1.4, color);
+    painter.circle(center, radius_px, Color32::TRANSPARENT, stroke);
+    // The handle leaves the circle at its lower-right, at 45 degrees.
+    let k = radius_px * std::f32::consts::FRAC_1_SQRT_2;
+    painter.line_segment(
+        [Pos2::new(center.x + k, center.y + k), Pos2::new(center.x + radius_px + 2.5, center.y + radius_px + 2.5)],
+        stroke,
+    );
+}
+
+/// Cheap width model so the name column truncates before the keycaps are drawn - from the
+/// measured chip, not from a guess about the font.
 fn estimate_keycaps_width(keys: &str) -> f32 {
-    let Ok(c) = Combo::parse(keys) else { return 48.0 };
+    let Ok(c) = Combo::parse(keys) else { return keycap_width("Ctrl") };
     c.0.iter()
-        .map(|k| (k.label().chars().count() as f32 * 7.0 + 12.0).max(size::KEYCAP_MIN_WIDTH))
+        .map(|k| keycap_width(&k.label()))
         .sum::<f32>()
         + size::KEYCAP_GAP * c.0.len().saturating_sub(1) as f32
 }
