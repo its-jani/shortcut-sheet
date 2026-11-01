@@ -14,7 +14,7 @@ free facts. No logos, names, marketing copy, or proprietary assets are used or s
 ## The core loop
 
 ```
-work in any app -> hold Ctrl ~0.9s -> overlay of that app's shortcuts appears
+work in any app -> hold Ctrl ~1.5s -> overlay of that app's shortcuts appears
 -> search or click a command -> the combo fires into the app you were in
 -> release Ctrl -> overlay hides, focus never left
 ```
@@ -89,17 +89,23 @@ inside the exe.
 
 ```
 settings.json                             trigger, hold_ms, theme, startup, fade, max_rows
-apps/<app>.json                           user overrides/shortcuts, same shape as builtin
+apps/<app>.json                           user overrides/shortcuts, a list of profiles
 learning/<App>_<Collection>.json          { "learnt": [...], "mastered": [...] }
 logs/shortcut-sheet.log.<date>            rolling diagnostics
 ```
+
+The compiled-in dataset (`src/data/apps.json`) is one document, not a bare list: `strings`
+holds the words the interface says, `defaults` holds what a fresh install does before a
+`settings.json` exists, `apps` holds the profiles with rows in them, and `known_apps` lists
+the apps that are recognised but not filled in yet. A **user** file stays the simpler shape —
+a list of profiles — because appending to a list is the friendlier thing to hand-edit.
 
 `settings.json` example:
 
 ```json
 {
   "trigger": "ctrl",
-  "hold_ms": 900,
+  "hold_ms": 1500,
   "theme": "system",
   "fade": 0.04,
   "run_on_startup": false,
@@ -107,7 +113,8 @@ logs/shortcut-sheet.log.<date>            rolling diagnostics
 }
 ```
 
-A user shortcut file (`apps/myapp.json`) that adds or edits commands:
+A user shortcut file (`apps/myapp.json`) that adds or edits commands. `aliases` are extra
+names the same command goes by, and the search matches them the way it matches `command`:
 
 ```json
 [
@@ -120,6 +127,7 @@ A user shortcut file (`apps/myapp.json`) that adds or edits commands:
         "name": "Everyday",
         "shortcuts": [
           { "command": "New file", "keys": "Ctrl+Alt+N" },
+          { "command": "Command palette", "keys": "Ctrl+Shift+P", "aliases": ["show commands"] },
           { "command": "Open file", "removed": true }
         ]
       }

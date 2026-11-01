@@ -20,3 +20,16 @@ Desktop.ini
 /target/
 replica/tmp/
 **/*.rs.bk
+
+# The target app, left on disk and never committed.
+#
+# replica/package/ is the vendor's own extracted MSIX: signed binaries, their tile art and
+# their manifest. Nothing in it is ours to redistribute, and the clean-room rule in
+# replica/recon.md says the same - it is read for metadata, not shipped.
+# replica/appdata/ is this machine's copy of the app's settings and progress, with registry
+# hives in it that name the user.
+# demo.mp4 is 371 MB, which is past what GitHub will accept in a push at all.
+replica/package/
+replica/appdata/
+replica/screens/demo.mp4
+*.mp4
