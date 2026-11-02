@@ -1,32 +1,36 @@
 feature,area,priority,original,clone,notes
-Global low-level keyboard hook detects a held modifier,overlay,must,yes,no,WH_KEYBOARD_LL; must reject injected input like the original does
-Hold-duration threshold before showing (default ~1000ms),overlay,must,yes,no,timing only; no key repeat spam
-Foreground process detection returns the active exe name,overlay,must,yes,no,GetForegroundWindow + GetWindowThreadProcessId + QueryFullProcessImageNameW
-exe name maps to a supported app profile,dataset,must,yes,no,case-insensitive; several exe names can map to one app
-Overlay lists that app's shortcuts grouped by collection,overlay,must,yes,no,S01
-Frameless always-on-top overlay centered on the foreground window,overlay,must,yes,no,not the screen; measured ~340x390
-Overlay never steals focus and focus restores cleanly,overlay,must,yes,no,WS_EX_NOACTIVATE | WS_EX_TOPMOST observed live
-Type-to-filter search across command names,overlay,must,yes,no,S01 search box
-Clicking or Enter on a row fires the real key combo into the app,overlay,must,yes,no,the payoff of the core loop
-Releasing the trigger key hides the overlay,overlay,must,yes,no
-User-editable JSON shortcut dataset,dataset,must,yes,no,our own file; schema in recon.md
-Keycap chips render modifiers and glyphs,overlay,must,yes,no,CTRL as word; Shift as glyph
-Tray icon; resident with no taskbar button,shell,must,yes,no,original uses H.NotifyIcon
-Light and dark theme following the system,shell,must,yes,no,both observed in vendor shot
-Practice hub: app grid grouped by category,practice,should,yes,no,S02
-App detail page with collections and mastered counts,practice,should,yes,no,S04
-Timed drill: type the combo within 2s to master it,practice,should,yes,no,S05
-learnt/mastered progress persisted per app+collection,practice,should,yes,no,format observed in the user's own LearningData json
-Configurable trigger hotkey and hold duration,settings,should,yes,no,documented by the vendor README
-Run on startup toggle,settings,should,yes,no,HKCU Run key instead of MSIX startup task
-Overlay opacity and max-height settings,settings,should,yes,no,inferred; not observed on the original
-Keyboard navigation of overlay rows with arrows and Enter,overlay,should,yes,no,needed for the accessibility claim
-Skip-for-now and shuffle in the drill,practice,could,yes,no
-Streaks and level-up summary,practice,could,yes,no,their gamification branding stays out
-Import the MIT-licensed upstream shortcut dataset with attribution,dataset,could,yes,no,facts are MIT; curation is not
-Per-monitor placement and full DPI awareness,multi-monitor,could,yes,no,original is PerMonitorV2
-Export and import all user data as one folder,backup,could,yes,no
-Fuzzy search matching command aliases,search,could,yes,no
+Global low-level keyboard hook detects a held modifier,overlay,must,yes,yes,WH_KEYBOARD_LL; must reject injected input like the original does; installed live and the trigger state machine has 16 unit tests against a synthetic key stream; the physical hold itself needs a human (BUG-009)
+Hold-duration threshold before showing (default ~1000ms),overlay,must,yes,yes,timing only; no key repeat spam; 1500 ms here - the figure the target's own first LongPressDelay write says - and it is a setting
+Foreground process detection returns the active exe name,overlay,must,yes,yes,GetForegroundWindow + GetWindowThreadProcessId + QueryFullProcessImageNameW; measured live via --detect on two real windows: brave.exe -> Known("Brave") and notepad.exe -> Unsupported(Some("notepad.exe"))
+exe name maps to a supported app profile,dataset,must,yes,yes,case-insensitive; several exe names can map to one app; both shelves indexed - 26 profiles over 38 exe names and 64 roster names; a user profile beats the roster for the same exe (unit-tested)
+Overlay lists that app's shortcuts grouped by collection,overlay,must,yes,yes,S01; collection header plus rows in replica/screens/clone-S01-peek.png
+Frameless always-on-top overlay centered on the foreground window,overlay,must,yes,yes,not the screen; measured 360x399 logical at 200% -> 720x798 px with PrintWindow and CopyFromScreen in agreement
+Overlay never steals focus and focus restores cleanly,overlay,must,yes,yes,WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW observed live and re-asserted every frame; measured focus not stolen: True; and the give-back half is measured too - Escape and Enter both log `focus handed back to the target hwnd=...` with `focus restored: True`; the browse-mode click logs `hand_backs=0` because the caret never moved; the one exception is a chord that opens a new window (BUG-016)
+Type-to-filter search across command names,overlay,must,yes,yes,measured end to end by replica/tmp/search.ps1: click in the field band -> overlay focused True and NOACTIVATE cleared -> type new -> 30 Chrome rows down to 3 -> Enter -> fired combo=Ctrl+T - the top of the filtered list
+Clicking or Enter on a row fires the real key combo into the app,overlay,must,yes,yes,the payoff of the core loop; measured: fired combo=Ctrl+T shows=1 fires=1 hand_backs=1 - and the hand-back line is timestamped 60 ms BEFORE the fired line which is what makes the chord land in the app and not in our own box (BUG-014)
+Releasing the trigger key hides the overlay,overlay,must,yes,yes,unit-tested state machine; the live release needs a physical hold; only the hold mode ends on a release - the instant chord has nothing to release and stays until dismissed
+User-editable JSON shortcut dataset,dataset,must,yes,yes,our own file; schema in recon.md; override and tombstone merge is unit-tested
+A recognised app with no rows still gets a named panel,dataset,could,yes,yes,64 roster names ship beside the 26 profiles and 60 of them carry an exe - those resolve as `Context::Empty` and paint the empty state - captured in replica/screens/roster-window.png (`--peek Slack`); the other 4 are names only and never match. What the TARGET shows for an app like this is not observed - this row is our reading of it
+Keycap chips render modifiers and glyphs,overlay,must,yes,yes,CTRL as word; Shift as glyph; rendering verified in the screenshot
+Tray icon; resident with no taskbar button,shell,must,yes,yes,Shell_NotifyIconW; log says installed and the window reads TOOLWINDOW=True APPWINDOW=False; the menu's Quit shares the tested try_close path but was not clicked itself
+Light and dark theme following the system,shell,must,yes,yes,both palettes rendered and re-captured on the current tokens (`clone-S01-light.png` / `clone-S01-dark.png` at 720x798); the OS app-mode is read on every hidden frame and settings.json can force either - measured light surface=#FFFFFF vs dark surface=#1F1F1F - and every palette value is pinned to tokens.json by `the_palette_mirrors_the_token_file`. Note the overlay's field and panel are the SAME measured hex in both themes; the field is proved by its rule and magnifier rather than a fill sample (BUG-011 was this row's black search box)
+Practice hub: app grid grouped by category,practice,should,yes,no,not built; by_category() is wired to nothing
+App detail page with collections and mastered counts,practice,should,yes,no,not built
+Timed drill: type the combo within 2s to master it,practice,should,yes,no,not built
+learnt/mastered progress persisted per app+collection,practice,should,yes,partial,recorded on every fire and survives a reload (unit-tested); nothing displays it because there is no hub or drill
+Configurable trigger hotkey and hold duration,settings,should,yes,partial,settings.json only and both are honoured by the hook; there is no S07 to change them in (BUG-010)
+Instant summon chord with no hold,settings,should,yes,yes,the target's `StaticShortcutKeys` - VK 91 + VK 18 = Win+Alt in the recorded configuration; wired as `instant_enabled` + `instant_hotkey` through the same hook and switchable off; `Combo::parse_hotkey` accepts a modifiers-only chord because a hotkey is watched and never fired; six unit tests drive the timing and a physical press still needs a human (BUG-009)
+Run on startup toggle,settings,should,yes,no,the field is parsed and saved and then ignored (BUG-010)
+Overlay opacity and max-height settings,settings,should,yes,no,both fields ignored; the panel max height is a token constant
+Keyboard navigation of overlay rows with arrows and Enter,overlay,should,yes,yes,selection index plus arrows and Enter implemented; measured with the pointer parked off the panel - type new; press Down once; New window highlights; Enter fires Ctrl+N and not Ctrl+T - and `arrows_move_the_one_row_that_enter_fires_and_records` pins that the row highlighted is the row fired is the row recorded as learnt
+Skip-for-now and shuffle in the drill,practice,could,yes,no,not built
+Streaks and level-up summary,practice,could,yes,no,not built; their gamification branding stays out either way
+Import the MIT-licensed upstream shortcut dataset with attribution,dataset,could,yes,no,the 26-profile dataset was written clean-room; no upstream file and no attribution notice
+Per-monitor placement and full DPI awareness,multi-monitor,could,yes,partial,PerMonitorV2 set before the first window and placement divides by the target window's own DPI; measured at 200% on one monitor; a second monitor has not been tested
+Export and import all user data as one folder,backup,could,yes,no,%LOCALAPPDATA%\shortcut-sheet is that folder by construction but there is no export or import command
+Fuzzy search matching command aliases,search,could,yes,yes,prefix / initials / substring / subsequence ranking over the command AND every alias - `Shortcut::names()` - with a 50k discount on an alias so the name the user can see outranks the name they cannot; measured live: typing `inspect element` in Chrome leaves exactly the one row whose label is `Developer tools`
+A second press of the summon chord puts the sheet away,overlay,could,no,yes,ours and not observed in the target: an instant session has no key release to hide on and no keyboard exit at all in browse mode. Over a DIFFERENT window the same press shows that app instead of only dismissing
+The sheet goes away when another window comes to the front,overlay,could,no,yes,ours; it fills the recon edge case `target app loses foreground while overlay open` and is what an instant session needs since no release is coming. 500 ms grace after the focus we ask for - without it a click into the search box dismisses itself on the frame after
 Vendor's collection naming ordering and curation,dataset,skip,yes,skip,their editorial work; shortcut-sheet writes its own
 Third-party app logos and names as shipped assets,branding,skip,yes,skip,trademarks of the app vendors; generic letter tiles instead
 Trial purchase and redemption-code licensing,licensing,skip,yes,skip,their commerce; the clone is free and open source
