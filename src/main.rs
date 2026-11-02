@@ -11,7 +11,6 @@ mod platform;
 mod ui;
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use app::{Sheet, WINDOW_TITLE};
 use data::Catalog;
@@ -37,12 +36,21 @@ fn main() -> eframe::Result<()> {
     };
 
     let settings = catalog.settings.clone();
+    // The two trigger modes the target's own `KeyboardShortcut` setting carries, turned into
+    // what the hook watches for: a key plus a delay, and a chord that needs neither.
+    let hook = platform::HookConfig {
+        trigger_vk: settings.trigger.vk(),
+        hold: settings.hold(),
+        long_press: settings.long_press_enabled,
+        chord: settings.instant_chord(),
+    };
     // One line per run in the log, so "it stopped working" has a starting point: version,
     // where the data was read from, and what the hook was told to watch for.
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         data_dir = %dir.display(),
         apps = catalog.apps.len(),
+        roster = catalog.known_apps.len(),
         shortcuts = catalog
             .apps
             .iter()
@@ -50,6 +58,9 @@ fn main() -> eframe::Result<()> {
             .sum::<usize>(),
         trigger = ?settings.trigger,
         hold_ms = settings.hold_ms,
+        long_press = hook.long_press,
+        instant = !hook.chord.is_empty(),
+        instant_hotkey = %settings.instant_hotkey,
         "shortcut-sheet starting"
     );
     // `--detect` answers one question and leaves: which process is in front, and which
@@ -60,8 +71,15 @@ fn main() -> eframe::Result<()> {
         let target = platform::foreground_window();
         let exe = target.and_then(|t| platform::process_name_of(t));
         let context = detect::resolve(&catalog, exe.as_deref());
-        tracing::info!(?exe, ?context, "foreground probe");
-        println!("exe={exe:?} context={context:?}");
+        // The roster also carries the category, which is the other half of "which schema
+        // profile does this window belong to" - the question a shortcut contribution starts
+        // from, and the one this probe exists to be able to answer on a real desktop.
+        let profile = exe
+            .as_deref()
+            .and_then(|e| catalog.known_app(e))
+            .map(|k| (k.name.as_str(), k.category.as_str()));
+        tracing::info!(?exe, ?context, ?profile, "foreground probe");
+        println!("exe={exe:?} context={context:?} roster_profile={profile:?}");
         return Ok(());
     }
 
@@ -72,13 +90,17 @@ fn main() -> eframe::Result<()> {
     let peek = peek_app(&catalog, std::env::args().skip(1));
     let (events, tray) = match peek {
         Some(_) => (None, None),
-        None => (
-            Some(platform::spawn_hook(
-                settings.trigger.vk(),
-                Duration::from_millis(settings.hold_ms),
-            )),
-            Some(platform::spawn_tray()),
-        ),
+        None => {
+            if !hook.long_press && hook.chord.is_empty() {
+                // Both modes off is a real configuration, not a broken one, but a global hook
+                // that watches for nothing is a keystroke callback paid for every key typed.
+                // The tray stays, because without it the only way out is Task Manager.
+                tracing::warn!("both trigger modes are off; the overlay can only be summoned with --peek");
+                (None, Some(platform::spawn_tray()))
+            } else {
+                (Some(platform::spawn_hook(hook)), Some(platform::spawn_tray()))
+            }
+        }
     };
 
     let viewport = egui::ViewportBuilder::default()

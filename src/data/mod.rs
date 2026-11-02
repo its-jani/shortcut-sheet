@@ -31,6 +31,17 @@ impl Shortcut {
     pub fn combo(&self) -> Result<Combo, key::ComboError> {
         Combo::parse(&self.keys)
     }
+
+    /// Every name this row answers to: the command first, then its aliases.
+    ///
+    /// The search scores all of them and keeps the best, because one command really does have
+    /// two names - "Developer tools" is what the menu calls it and "inspect element" is what
+    /// the person who taught you called it. Only the first is drawn; the rest are for finding.
+    pub fn names(&self) -> Vec<&str> {
+        let mut names = vec![self.command.as_str()];
+        names.extend(self.aliases.iter().map(|a| a.as_str()));
+        names
+    }
 }
 
 /// A named group of shortcuts - the row you see in S04 and the header you see in S01.
@@ -154,12 +165,23 @@ impl Trigger {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// The key a *hold* is measured on - the target's `LongPressKey`.
     pub trigger: Trigger,
-    /// How long the trigger must be held before the overlay appears.
+    /// How long the trigger must be held before the overlay appears (`LongPressDelay`).
     pub hold_ms: u64,
-    pub theme: Theme,
+    /// Long-press mode on or off (`LongPressShortcutEnabled`).
+    pub long_press_enabled: bool,
+    /// Instant mode (`StaticShortcutEnabled`): the chord below brings the sheet up the moment
+    /// it is complete, with no hold, and it stays up until the user leaves it.
+    pub instant_enabled: bool,
+    /// The instant chord, written the way every other chord in this project is written
+    /// (`StaticShortcutKeys`, which the observed configuration spells `[91, 18]` = Win+Alt).
+    /// Parsed by [`Combo::parse_hotkey`], which like this field is about pressing keys
+    /// together rather than firing one into an app.
+    pub instant_hotkey: String,
     /// 0.0 - 0.25: how much to fade the overlay background.
     pub fade: f32,
+    pub theme: Theme,
     pub run_on_startup: bool,
     pub max_rows: usize,
 }
@@ -172,10 +194,42 @@ impl Default for Settings {
             // `00:00:01.5` before any of the user's changes, and a shorter threshold fires
             // the overlay every time someone uses Ctrl+C.
             hold_ms: 1500,
-            theme: Theme::default(),
+            // The mode this product was built around, so it is the one that ships on.
+            long_press_enabled: true,
+            // Off by default: a second global chord the user has not asked for is a key
+            // binding stolen from whatever else uses it. The recorded configuration had it
+            // on and long-press off, which is a choice, not a default.
+            instant_enabled: false,
+            instant_hotkey: "Win+Alt".into(),
             fade: 0.04,
+            theme: Theme::default(),
             run_on_startup: false,
             max_rows: 40,
+        }
+    }
+}
+
+impl Settings {
+    pub fn hold(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.hold_ms)
+    }
+
+    /// Virtual-key codes for the instant chord, or an empty list when the mode is off.
+    ///
+    /// An unparseable `instant_hotkey` disables the instant mode instead of disabling the
+    /// app, and says so in the log: this file is hand-edited, and one typo in a settings
+    /// string must not put a resident utility's whole trigger path out of action.
+    pub fn instant_chord(&self) -> Vec<u32> {
+        if !self.instant_enabled {
+            return Vec::new();
+        }
+        match Combo::parse_hotkey(&self.instant_hotkey) {
+            Ok(c) => c.0.iter().map(|k| u32::from(k.vk())).collect(),
+            Err(e) => {
+                tracing::error!(hotkey = %self.instant_hotkey, error = %e,
+                    "instant_hotkey does not parse; the instant trigger is off");
+                Vec::new()
+            }
         }
     }
 }
@@ -272,16 +326,27 @@ pub struct Dataset {
     pub known_apps: Vec<KnownApp>,
 }
 
+/// Where a process name lands in the catalogue. Two lists, two answers, one index: a profile
+/// has rows to show, a roster entry has only a name and a category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shelf {
+    /// A profile with shortcuts in it, by index into [`Catalog::apps`].
+    Profile(usize),
+    /// A name the roster knows and this build ships no rows for, by index into
+    /// [`Catalog::known_apps`].
+    Roster(usize),
+}
+
 /// Everything the app knows, merged and indexed.
 pub struct Catalog {
     pub apps: Vec<AppProfile>,
-    by_exe: HashMap<String, usize>,
+    by_exe: HashMap<String, Shelf>,
     pub settings: Settings,
     /// The words the interface says, read by the overlay on every frame it paints.
     pub strings: Strings,
-    /// Profiles with no rows yet. Detection reads them in the engine pass; until then they
-    /// are carried, not ignored, so the roster the target loads is on disk in one place.
-    #[allow(dead_code)]
+    /// Apps the target supports that we have no rows for: enough to recognise the window and
+    /// name it, not enough to fill the overlay. The list was read off the target's own startup
+    /// log, which names every profile it loads.
     pub known_apps: Vec<KnownApp>,
     learning: HashMap<(String, String), Learning>,
     dir: PathBuf,
@@ -344,10 +409,17 @@ impl Catalog {
             }
         }
 
+        // One namespace, two shelves: `no_exe_is_claimed_twice` is the test that keeps
+        // "which app is this window" from ever having two answers.
         let mut by_exe = HashMap::new();
         for (i, app) in apps.iter().enumerate() {
             for exe in &app.exe {
-                by_exe.insert(exe.to_ascii_lowercase(), i);
+                by_exe.insert(exe.to_ascii_lowercase(), Shelf::Profile(i));
+            }
+        }
+        for (i, known) in doc.known_apps.iter().enumerate() {
+            for exe in &known.exe {
+                by_exe.entry(exe.to_ascii_lowercase()).or_insert(Shelf::Roster(i));
             }
         }
 
@@ -365,12 +437,40 @@ impl Catalog {
         })
     }
 
+    /// The profile for a process name, if we ship rows for it.
     pub fn find_by_exe(&self, exe: &str) -> Option<&AppProfile> {
-        self.by_exe.get(&exe.to_ascii_lowercase()).map(|i| &self.apps[*i])
+        match self.locate(exe)? {
+            Shelf::Profile(i) => Some(&self.apps[i]),
+            Shelf::Roster(_) => None,
+        }
+    }
+
+    /// Which shelf a process name sits on. Detection goes through this rather than
+    /// [`Catalog::find_by_exe`] because "we know this app and have nothing for it" is a
+    /// different answer from "we have never heard of this app", and only the second one
+    /// should leave the overlay off entirely.
+    pub fn locate(&self, exe: &str) -> Option<Shelf> {
+        self.by_exe.get(&exe.to_ascii_lowercase()).copied()
+    }
+
+    /// The roster entry for a process name we recognise but have no rows for.
+    pub fn known_app(&self, exe: &str) -> Option<&KnownApp> {
+        match self.locate(exe)? {
+            Shelf::Roster(i) => Some(&self.known_apps[i]),
+            Shelf::Profile(_) => None,
+        }
     }
 
     pub fn app(&self, name: &str) -> Option<&AppProfile> {
         self.apps.iter().find(|a| a.name == name)
+    }
+
+    /// Does either shelf know this name? A display name is the only handle the command line
+    /// and the hub give us, and "an app with no rows" must not read as "a typo": both are
+    /// displayable, and only the second one is worth quitting over.
+    pub fn knows(&self, name: &str) -> bool {
+        self.apps.iter().any(|a| a.name == name)
+            || self.known_apps.iter().any(|k| k.name == name)
     }
 
     /// Category grouping for the hub grid (S02). Not wired into the overlay build yet.
@@ -748,7 +848,115 @@ mod tests {
         assert_eq!(c.settings.hold_ms, 1500);
         assert_eq!(c.settings.trigger, Trigger::Ctrl);
         assert_eq!(c.settings.theme, Theme::System);
+        assert!(c.settings.long_press_enabled, "the mode the product is built around");
+        assert!(!c.settings.instant_enabled, "a second global chord is opt-in");
+        assert_eq!(c.settings.instant_hotkey, "Win+Alt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two modes the target's own `KeyboardShortcut` setting carries, in the shape our
+    /// settings file writes them: one is a key and a delay, the other is a chord.
+    #[test]
+    fn both_trigger_modes_are_configurable_and_independent() {
+        let s: Settings = serde_json::from_str(
+            r#"{"long_press_enabled":false,"instant_enabled":true,"instant_hotkey":"Win+Alt"}"#,
+        )
+        .unwrap();
+        assert!(!s.long_press_enabled);
+        assert_eq!(s.instant_chord(), vec![0x5B, 0x12], "Win then Alt, canonical order");
+
+        // Recorded as the very first write in the target's log: instant mode on with the
+        // plain Ctrl code, which is a chord of one and therefore not a chord at all.
+        let s: Settings =
+            serde_json::from_str(r#"{"instant_enabled":true,"instant_hotkey":"Ctrl"}"#).unwrap();
+        assert!(s.instant_chord().is_empty(), "a bare modifier cannot be an instant trigger");
+    }
+
+    #[test]
+    fn an_off_instant_mode_never_reads_the_chord() {
+        // Off means off, even with a perfectly good value in the file: the hook must not
+        // install a chord watcher the user turned off, and must not complain about a string
+        // it has been told to ignore.
+        let s: Settings = serde_json::from_str(
+            r#"{"instant_enabled":false,"instant_hotkey":"Win+TotallyBogus"}"#,
+        )
+        .unwrap();
+        assert!(s.instant_chord().is_empty());
+    }
+
+    #[test]
+    fn a_broken_chord_disables_the_instant_mode_rather_than_the_app() {
+        let s: Settings =
+            serde_json::from_str(r#"{"instant_enabled":true,"instant_hotkey":"Win+Banan"}"#)
+                .unwrap();
+        assert!(s.instant_chord().is_empty(), "a typo must not kill the hold trigger");
+        // And the mode the user is actually relying on still works.
+        assert_eq!(s.trigger, Trigger::Ctrl);
+        assert_eq!(s.hold(), std::time::Duration::from_millis(1500));
+    }
+
+    /// Detection needs the roster, or every app the target supports and we have not written
+    /// rows for looks like an app nobody has heard of.
+    #[test]
+    fn the_roster_is_indexed_for_detection() {
+        let dir = tempdir("roster-index");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Catalog::load(&dir).unwrap();
+
+        // A name we ship rows for sits on the profile shelf...
+        assert!(matches!(c.locate("chrome.exe"), Some(Shelf::Profile(_))));
+        assert!(c.find_by_exe("chrome.exe").is_some());
+        // ...and one we only know by name sits on the roster shelf.
+        assert!(matches!(c.locate("slack.exe"), Some(Shelf::Roster(_))));
+        let known = c.known_app("slack.exe").expect("slack is in the roster");
+        assert_eq!(known.name, "Slack");
+        assert!(
+            c.find_by_exe("slack.exe").is_none(),
+            "a roster entry has no rows, so it must not resolve as a profile"
+        );
+        assert_eq!(c.locate("nobody-has-heard-of-this.exe"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_user_profile_wins_the_exe_over_the_roster() {
+        // The roster is a list of names, not a claim on them: the moment the user writes a
+        // Slack file, slack.exe has to stop resolving as "known, empty" and start resolving
+        // as the app they just described. Profiles are indexed first, so they do.
+        let c = catalog_with(r#"[{
+            "name": "Slack",
+            "category": "Communication",
+            "exe": ["slack.exe"],
+            "collections": [{"name": "Messaging", "shortcuts": [
+                {"command": "Go to next unread", "keys": "Shift+Alt+K"}
+            ]}]
+        }]"#);
+        assert!(matches!(c.locate("slack.exe"), Some(Shelf::Profile(_))), "the user's profile owns the name");
+        assert!(c.known_app("slack.exe").is_none(), "no longer a roster-only app");
+        assert_eq!(
+            crate::detect::resolve(&c, Some("slack.exe")),
+            crate::detect::Context::Known("Slack".into())
+        );
+    }
+
+    #[test]
+    fn names_are_the_command_plus_everything_else_it_is_called() {
+        let s = Shortcut {
+            command: "Developer tools".into(),
+            keys: "Ctrl+Shift+I".into(),
+            aliases: vec!["inspect element".into(), "devtools".into()],
+            removed: false,
+        };
+        assert_eq!(s.names(), vec!["Developer tools", "inspect element", "devtools"]);
+        // The order matters: the name drawn in the row has to be the one that scored first.
+        let bare = Shortcut {
+            command: "Copy".into(),
+            keys: "Ctrl+C".into(),
+            aliases: vec![],
+            removed: false,
+        };
+        assert_eq!(bare.names(), vec!["Copy"]);
     }
 
     #[test]
@@ -923,7 +1131,7 @@ mod tests {
         assert!(
             crate::detect::visible_rows(app)
                 .into_iter()
-                .all(|(_, ci, si)| app.collections[ci].shortcuts[si].command != "Open file"),
+                .all(|(ci, si)| app.collections[ci].shortcuts[si].command != "Open file"),
             "the overlay would still show a removed shortcut"
         );
         let _ = std::fs::remove_dir_all(&dir);

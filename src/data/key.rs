@@ -200,6 +200,21 @@ impl Combo {
     /// Fails loudly: a malformed dataset must stop startup with the offending string,
     /// not silently render an empty keycap later.
     pub fn parse(s: &str) -> Result<Self, ComboError> {
+        Self::read(s, false)
+    }
+
+    /// Parse the chord that summons the overlay itself, where `"Win+Alt"` is legal.
+    ///
+    /// [`Combo::parse`] refuses a modifiers-only chord on purpose: there would be no key to
+    /// fire into another app. A hotkey is the other case - it is never sent anywhere, only
+    /// watched for - and the observed configuration of the target uses exactly `Win+Alt`
+    /// (`StaticShortcutKeys: [91, 18]`), two modifiers and nothing else. Same token grammar,
+    /// same canonical order, one rule switched off.
+    pub fn parse_hotkey(s: &str) -> Result<Self, ComboError> {
+        Self::read(s, true)
+    }
+
+    fn read(s: &str, modifiers_ok: bool) -> Result<Self, ComboError> {
         let mut keys = Vec::new();
         for tok in s.split('+') {
             let tok = tok.trim();
@@ -217,14 +232,22 @@ impl Combo {
         if keys.is_empty() {
             return Err(ComboError::Empty(s.to_string()));
         }
-        if keys.iter().all(Key::is_modifier) {
+        if !modifiers_ok && keys.iter().all(Key::is_modifier) {
             return Err(ComboError::ModifiersOnly(s.to_string()));
         }
         // A chord like Ctrl+K,S is two presses in sequence, not one simultaneous press.
         // Firing it as a single SendInput burst would do something different and wrong,
-        // so we refuse it at load time rather than mis-fire at the user.
+        // so we refuse it at load time rather than mis-fire at the user. A hotkey is
+        // watched, not fired, but the same ambiguity would make it unpressable, so the
+        // rule holds for both spellings.
         if keys.iter().filter(|k| !k.is_modifier()).count() > 1 {
             return Err(ComboError::NotAChord(s.to_string()));
+        }
+        if keys.iter().all(Key::is_modifier) && keys.len() < 2 {
+            // A one-key hotkey (`"Ctrl"`) is the hold mode with the delay taken to zero: it
+            // would summon the sheet on every press of a key the user types hundreds of times
+            // a day. Two keys minimum is what makes an instant chord a chord.
+            return Err(ComboError::ModifiersOnly(s.to_string()));
         }
         // Modifiers first, in canonical order, then the trigger key. Keeps rendering
         // and de-duplication stable regardless of how the author wrote it.
@@ -311,6 +334,49 @@ mod tests {
             Combo::parse("Ctrl+Shift").unwrap_err(),
             ComboError::ModifiersOnly(_)
         ));
+    }
+
+    #[test]
+    fn a_hotkey_may_be_modifiers_only_because_it_is_never_fired() {
+        // The instant trigger the observed config uses. `parse` refuses it, `parse_hotkey`
+        // does not, and neither is wrong: one sends a chord, the other watches for one.
+        assert!(matches!(
+            Combo::parse("Win+Alt").unwrap_err(),
+            ComboError::ModifiersOnly(_)
+        ));
+        let hot = Combo::parse_hotkey("alt+win").unwrap();
+        assert_eq!(hot.0, vec![Key::Win, Key::Alt], "canonical modifier order");
+    }
+
+    #[test]
+    fn a_hotkey_may_end_on_an_ordinary_key() {
+        // Both shapes the target's own settings log shows: [91, 18] and [91, 8].
+        assert_eq!(Combo::parse_hotkey("Win+Backspace").unwrap().0, vec![Key::Win, Key::Backspace]);
+        assert_eq!(Combo::parse_hotkey("Win+Alt+`").unwrap().0, vec![Key::Win, Key::Alt, Key::Grave]);
+    }
+
+    #[test]
+    fn a_single_modifier_is_not_a_hotkey() {
+        // Watching for a bare Ctrl to appear instantly would pop the sheet over every Ctrl+C.
+        assert!(matches!(
+            Combo::parse_hotkey("Ctrl").unwrap_err(),
+            ComboError::ModifiersOnly(_)
+        ));
+    }
+
+    #[test]
+    fn a_hotkey_still_rejects_two_sequential_presses() {
+        assert!(matches!(
+            Combo::parse_hotkey("Win+K+S").unwrap_err(),
+            ComboError::NotAChord(_)
+        ));
+    }
+
+    #[test]
+    fn a_broken_hotkey_names_the_string_that_is_broken() {
+        // The settings file is hand-edited, so the error has to say which value is at fault.
+        let err = Combo::parse_hotkey("Win+Banan").unwrap_err();
+        assert!(err.to_string().contains("Banan"), "{err}");
     }
 
     #[test]

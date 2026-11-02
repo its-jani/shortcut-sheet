@@ -8,7 +8,7 @@ use egui::{Align, Color32, Layout, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, Ve
 
 use crate::data::{AppProfile, Catalog, Combo, Strings};
 use crate::detect;
-use crate::ui::{font, hover_fill, keycap, keycap_width, radius, rank, size, Palette};
+use crate::ui::{font, hover_fill, keycap, keycap_width, radius, rank, size, Palette, SearchRow};
 
 /// What the overlay decided during this frame.
 #[derive(Debug, PartialEq)]
@@ -22,9 +22,12 @@ pub enum Action {
     GiveUpFocus,
 }
 
-/// One resolved row, ready to draw.
+/// One resolved row, ready to draw. The collection name is carried on the row rather than
+/// looked up through the profile, because a roster app has no profile to look anything up in
+/// and the panel still has to paint.
 struct Row {
     collection: usize,
+    collection_name: String,
     shortcut: usize,
     name: String,
     keys: String,
@@ -44,14 +47,20 @@ pub struct Overlay {
 
 impl Overlay {
     /// Load a profile into the view. Called on every show.
+    ///
+    /// A name the roster knows but that ships no rows still opens a panel: it names the app
+    /// and shows the empty state. Refusing to open would make "we know this window and have
+    /// nothing written for it yet" indistinguishable from "this key does nothing here".
     pub fn open(&mut self, catalog: &Catalog, app_name: &str) {
-        let Some(app) = catalog.app(app_name) else { return };
-        self.app = Some(app.name.clone());
+        self.app = Some(app_name.to_string());
         self.query.clear();
         self.selected = 0;
         self.focused = false;
         self.pending_enter = false;
-        self.rebuild(app);
+        self.rows.clear();
+        if let Some(app) = catalog.app(app_name) {
+            self.rebuild(app);
+        }
     }
 
     pub fn close(&mut self) {
@@ -94,10 +103,15 @@ impl Overlay {
         self.selected = (cur + delta).clamp(0, n - 1) as usize;
     }
 
+    /// Re-rank the profile's rows against the current query, aliases included.
     fn rebuild(&mut self, app: &AppProfile) {
-        let items: Vec<(String, usize, usize)> = detect::visible_rows(app)
+        let items: Vec<SearchRow> = detect::visible_rows(app)
             .into_iter()
-            .map(|(_, ci, si)| (app.collections[ci].shortcuts[si].command.clone(), ci, si))
+            .map(|(ci, si)| SearchRow {
+                names: app.collections[ci].shortcuts[si].names(),
+                collection: ci,
+                shortcut: si,
+            })
             .collect();
 
         let order = rank(&items, &self.query);
@@ -107,6 +121,7 @@ impl Overlay {
                 let s = &app.collections[ci].shortcuts[si];
                 Row {
                     collection: ci,
+                    collection_name: app.collections[ci].name.clone(),
                     shortcut: si,
                     name: s.command.clone(),
                     keys: s.keys.clone(),
@@ -128,7 +143,10 @@ impl Overlay {
         keys: &KeyFlags,
     ) -> Action {
         let Some(name) = self.app.clone() else { return Action::Nothing };
-        let Some(app) = catalog.app(&name) else { return Action::Nothing };
+        // A roster app has no profile to look up. That is not a reason to paint nothing: the
+        // rows below are already empty, and the panel's only job for this case is to name the
+        // window the user is standing in and show the empty state.
+        let app = catalog.app(&name);
 
         // Keys only reach us in focused mode; in browse mode the target app still owns them.
         if self.focused {
@@ -159,15 +177,17 @@ impl Overlay {
         frame.show(ui, |ui| {
             ui.set_width(size::OVERLAY_WIDTH - size::PADDING * 2.0);
             let s = &catalog.strings;
-            self.title_bar(ui, p, app, &mut action);
+            self.title_bar(ui, p, &name, &mut action);
             self.search_bar(ui, p, s, &mut action);
             ui.add_space(size::SECTION_GAP - 4.0);
-            self.list(ui, p, s, app, &mut action);
+            self.list(ui, p, s, &mut action);
         });
 
         // Re-filter only when the text actually changed, so we do not rebuild every frame.
         if self.query != before_query || (self.query.is_empty() && before != self.rows.len()) {
-            self.rebuild(app);
+            if let Some(app) = app {
+                self.rebuild(app);
+            }
             if self.query != before_query {
                 self.selected = 0;
             }
@@ -178,7 +198,9 @@ impl Overlay {
 
     /// The panel's own header: which app the sheet is about, and the way out. Drawn at the
     /// measured 36 logical px so the row underneath always starts where the token says it does.
-    fn title_bar(&mut self, ui: &mut Ui, p: &Palette, app: &AppProfile, action: &mut Action) {
+    ///
+    /// Named from the session, not from a profile, so a roster app gets a titled panel too.
+    fn title_bar(&mut self, ui: &mut Ui, p: &Palette, name: &str, action: &mut Action) {
         let (bar, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), size::TITLE_BAR_HEIGHT),
             Sense::hover(),
@@ -195,10 +217,10 @@ impl Overlay {
                 .max_rect(row)
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
-                crate::ui::letter_avatar(ui, &app.name, p, 16.0);
+                crate::ui::letter_avatar(ui, name, p, 16.0);
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new(&app.name)
+                    egui::RichText::new(name)
                         .font(font::title())
                         .color(p.text_primary),
                 );
@@ -279,7 +301,7 @@ impl Overlay {
         );
     }
 
-    fn list(&mut self, ui: &mut Ui, p: &Palette, s: &Strings, app: &AppProfile, action: &mut Action) {
+    fn list(&mut self, ui: &mut Ui, p: &Palette, s: &Strings, action: &mut Action) {
         let hover = hover_fill(p);
 
         ScrollArea::vertical()
@@ -333,7 +355,7 @@ impl Overlay {
                         ui.painter().text(
                             Pos2::new(header.min.x, header.center().y),
                             egui::Align2::LEFT_CENTER,
-                            &app.collections[row.collection].name,
+                            &row.collection_name,
                             font::header(),
                             p.text_secondary,
                         );
@@ -452,4 +474,170 @@ fn estimate_keycaps_width(keys: &str) -> f32 {
         .map(|k| keycap_width(&k.label()))
         .sum::<f32>()
         + size::KEYCAP_GAP * c.0.len().saturating_sub(1) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn catalog() -> Catalog {
+        // No user files: the view is being checked against the built-in dataset.
+        let dir = std::env::temp_dir().join(format!("ss-overlay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Catalog::load(&dir).expect("builtin catalog")
+    }
+
+    #[test]
+    fn opening_an_app_lists_its_rows_from_the_top() {
+        let c = catalog();
+        let mut o = Overlay::default();
+        o.open(&c, "Google Chrome");
+        assert!(o.is_open());
+        assert!(o.row_count() > 10, "Chrome ships rows, got {}", o.row_count());
+        assert_eq!(o.selected, 0);
+        assert!(!o.focused, "a sheet summoned by a key does not grab the caret");
+        assert!(o.selected_combo().is_some(), "the first row is fireable");
+    }
+
+    /// The roster's whole purpose in the view layer: a window we recognise gets a named panel
+    /// that says it has nothing yet, instead of the key appearing to do nothing.
+    #[test]
+    fn a_roster_app_opens_a_named_panel_with_nothing_in_it() {
+        let c = catalog();
+        assert!(c.app("Slack").is_none(), "Slack must be a roster name, not a profile");
+        let mut o = Overlay::default();
+        o.open(&c, "Slack");
+        assert_eq!(o.app.as_deref(), Some("Slack"), "the title bar has to say which app this is");
+        assert_eq!(o.row_count(), 0);
+        assert!(o.selected_combo().is_none(), "an empty panel must not fire anything");
+        assert!(o.selected_entry(&c).is_none(), "and must not record progress against nothing");
+    }
+
+    #[test]
+    fn typing_the_other_name_of_a_command_finds_the_row() {
+        // "Developer tools" is what the menu calls it. This is the alias field earning its
+        // keep: before it, this query filtered Chrome's list down to nothing.
+        let c = catalog();
+        let mut o = Overlay::default();
+        o.open(&c, "Google Chrome");
+        let all = o.row_count();
+        o.query = "inspect element".into();
+        o.rebuild(c.app("Google Chrome").unwrap());
+
+        assert_eq!(o.row_count(), 1, "one row answers to that name, out of {all}");
+        assert_eq!(o.rows[0].name, "Developer tools", "the row drawn is the command's own name");
+        assert_eq!(o.rows[0].collection_name, "Page and address");
+        assert_eq!(o.selected_combo().map(|x| x.to_string()), Some("Ctrl+Shift+I".into()));
+    }
+
+    #[test]
+    fn an_alias_match_and_the_label_match_reach_the_same_row() {
+        let c = catalog();
+        let mut o = Overlay::default();
+        o.open(&c, "Visual Studio Code");
+
+        o.query = "palette".into();
+        o.rebuild(c.app("Visual Studio Code").unwrap());
+        assert_eq!(o.rows[0].name, "Command palette", "the label finds it");
+
+        o.query = "show commands".into();
+        o.rebuild(c.app("Visual Studio Code").unwrap());
+        assert_eq!(o.rows[0].name, "Command palette", "and so does the alias");
+    }
+
+    #[test]
+    fn clearing_the_search_brings_the_whole_list_back() {
+        let c = catalog();
+        let mut o = Overlay::default();
+        o.open(&c, "Google Chrome");
+        let all = o.row_count();
+        o.query = "tab".into();
+        o.rebuild(c.app("Google Chrome").unwrap());
+        assert!(o.row_count() < all && o.row_count() > 0);
+        o.query.clear();
+        o.rebuild(c.app("Google Chrome").unwrap());
+        assert_eq!(o.row_count(), all, "a filter is a view, not a deletion");
+    }
+
+    /// The invariant the three exit paths share: one row index drives what is highlighted,
+    /// what is fired, and what is recorded as learnt. If those could disagree, Enter would fire
+    /// a different shortcut from the one the user is looking at.
+    #[test]
+    fn arrows_move_the_one_row_that_enter_fires_and_records() {
+        let c = catalog();
+        let mut o = Overlay::default();
+        o.open(&c, "Google Chrome");
+        o.focused = true;
+
+        let before = o.selected_combo();
+        o.move_selection(3);
+        let after = o.selected_combo();
+        assert_ne!(before, after, "the arrows have to change what Enter fires");
+
+        let row = &o.rows[o.selected];
+        let expected = Combo::parse(&row.keys).ok().map(|x| x.to_string());
+        assert_eq!(after.map(|x| x.to_string()), expected, "Enter fires the highlighted row");
+        let (collection, command) = o.selected_entry(&c).expect("the highlighted row is real");
+        assert_eq!(command, row.name, "the row recorded as learnt is the row highlighted");
+        assert_eq!(collection, row.collection_name);
+    }
+
+    #[test]
+    fn the_selection_clamps_at_both_ends_instead_of_falling_off() {
+        let c = catalog();
+        let mut o = Overlay::default();
+        o.open(&c, "Google Chrome");
+        let last = o.row_count() - 1;
+        o.move_selection(1000);
+        assert_eq!(o.selected, last, "a hundred downs still leaves a row highlighted");
+        assert!(o.selected_combo().is_some(), "and Enter still has something to fire");
+        o.move_selection(-1000);
+        assert_eq!(o.selected, 0);
+    }
+
+    #[test]
+    fn narrowing_the_list_below_the_selection_does_not_leave_it_pointing_at_nothing() {
+        // Type while row 20 is highlighted: the old index has to come back inside the new list
+        // rather than fire nothing or fire the wrong row.
+        let c = catalog();
+        let mut o = Overlay::default();
+        o.open(&c, "Google Chrome");
+        o.move_selection(20);
+        o.query = "zoom".into();
+        o.rebuild(c.app("Google Chrome").unwrap());
+        assert!(o.selected < o.row_count(), "selected {} of {}", o.selected, o.row_count());
+        assert!(o.selected_combo().is_some());
+    }
+
+    #[test]
+    fn closing_forgets_the_app_the_search_and_the_selection() {
+        // Alt-Tab from Chrome to VS Code and summon again: the second sheet must start clean on
+        // the editor, with no leftover query and nothing carried over from row 6.
+        let c = catalog();
+        let mut o = Overlay::default();
+        o.open(&c, "Google Chrome");
+        o.query = "tab".into();
+        o.rebuild(c.app("Google Chrome").unwrap());
+        o.move_selection(5);
+        o.focused = true;
+        o.close();
+
+        assert!(!o.is_open());
+        o.open(&c, "Visual Studio Code");
+        assert_eq!(o.app.as_deref(), Some("Visual Studio Code"));
+        assert!(o.query.is_empty(), "the previous filter must not carry over");
+        assert_eq!(o.selected, 0, "nor must the previous row");
+        assert!(!o.focused, "a new session does not inherit the caret");
+        assert!(!o.rows.is_empty(), "and it lists the editor's rows");
+    }
+
+    #[test]
+    fn nothing_can_be_fired_when_the_panel_is_closed() {
+        let c = catalog();
+        let mut o = Overlay::default();
+        assert_eq!(o.selected_combo(), None, "no app, no combo");
+        assert!(o.selected_entry(&c).is_none());
+        o.move_selection(4);
+        assert_eq!(o.selected, 0, "arrows on an empty list do nothing");
+    }
 }

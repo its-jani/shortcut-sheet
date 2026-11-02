@@ -373,13 +373,48 @@ pub fn search_score(haystack: &str, needle: &str) -> Option<i64> {
     }
 }
 
-/// Rank a list of command names by relevance to `query`, keeping the dataset order for
-/// ties. Empty query returns everything, unsorted.
-pub fn rank<'a>(items: &'a [(String, usize, usize)], query: &str) -> Vec<(usize, usize)> {
-    let mut scored: Vec<(i64, usize, usize)> = items
+/// An alias is a courtesy, not a second title: a row whose own name matches is the better
+/// answer than a row only reachable through a name the user cannot see. The discount is
+/// smaller than the gap between match bands (100_000), so an alias prefix still beats a
+/// mid-word hit on the real name, and an alias subsequence still loses to one.
+const ALIAS_DECAY: i64 = 50_000;
+
+/// The best score a query gets across every name one row goes by.
+///
+/// `names[0]` is the command as it is drawn; everything after it is an alias. Without this,
+/// typing "inspect element" finds nothing while the row that *is* inspect element sits there
+/// under its menu's name.
+pub fn best_score(names: &[&str], needle: &str) -> Option<i64> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    names
         .iter()
-        .map(|(name, c, s)| (search_score(name, query).unwrap_or(i64::MIN), *c, *s))
-        .filter(|(score, _, _)| *score != i64::MIN)
+        .enumerate()
+        .filter_map(|(i, name)| {
+            let score = search_score(name, needle)?;
+            Some(if i == 0 { score } else { score - ALIAS_DECAY })
+        })
+        .max()
+}
+
+/// One row as the search sees it: the names it answers to, and where it lives in the profile.
+#[derive(Debug, Clone)]
+pub struct SearchRow<'a> {
+    /// Command name first, then its aliases. `Shortcut::names` produces this shape.
+    pub names: Vec<&'a str>,
+    pub collection: usize,
+    pub shortcut: usize,
+}
+
+/// Rank rows by relevance to `query`, keeping the dataset order for ties. Empty query returns
+/// everything, unsorted.
+pub fn rank(rows: &[SearchRow<'_>], query: &str) -> Vec<(usize, usize)> {
+    let mut scored: Vec<(i64, usize, usize)> = rows
+        .iter()
+        .filter_map(|r| {
+            best_score(&r.names, query).map(|score| (score, r.collection, r.shortcut))
+        })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     scored.into_iter().map(|(_, c, s)| (c, s)).collect()
@@ -457,14 +492,17 @@ mod tests {
         assert!(search_score("Copy", "xyz").is_none());
     }
 
+    /// The rows the tests talk about, in the shape `Shortcut::names` produces: name first,
+    /// aliases after it.
+    fn row(names: &[&'static str], collection: usize, shortcut: usize) -> SearchRow<'static> {
+        SearchRow { names: names.to_vec(), collection, shortcut }
+    }
+
     #[test]
     fn rank_preserves_order_for_equal_scores() {
         // Same length, same prefix - the scorer gives both the same number, so the only
         // thing left to order them by is the order they appear in the dataset.
-        let items = vec![
-            ("Copy".to_string(), 0usize, 0usize),
-            ("Crop".to_string(), 0usize, 1usize),
-        ];
+        let items = vec![row(&["Copy"], 0, 0), row(&["Crop"], 0, 1)];
         let r = rank(&items, "c");
         assert_eq!(r.len(), 2);
         assert_eq!(r[0], (0, 0), "ties keep dataset order");
@@ -475,19 +513,70 @@ mod tests {
         // Deliberate: typing "c" in Chrome's list should put "Copy" above "Collapse all
         // folders", because the tighter match is the more likely one.
         let items = vec![
-            ("Collapse all folders".to_string(), 0usize, 0usize),
-            ("Copy".to_string(), 0usize, 1usize),
+            row(&["Collapse all folders"], 0, 0),
+            row(&["Copy"], 0, 1),
         ];
         assert_eq!(rank(&items, "c"), vec![(0, 1), (0, 0)]);
     }
 
     #[test]
     fn rank_drops_non_matches() {
-        let items = vec![
-            ("Copy".to_string(), 0usize, 0usize),
-            ("Paste".to_string(), 0usize, 1usize),
-        ];
+        let items = vec![row(&["Copy"], 0, 0), row(&["Paste"], 0, 1)];
         assert_eq!(rank(&items, "cop"), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn an_empty_query_keeps_every_row_in_dataset_order() {
+        let items = vec![row(&["Copy"], 0, 0), row(&["Paste"], 0, 1)];
+        assert_eq!(rank(&items, ""), vec![(0, 0), (0, 1)]);
+    }
+
+    /// The alias half of the search. These are the real dataset's rows, because the point of
+    /// the feature is that typing the other name of a command has to find it.
+    #[test]
+    fn a_row_can_be_found_by_a_name_it_does_not_display() {
+        let devtools = row(&["Developer tools", "inspect element"], 1, 2);
+        let copy = row(&["Copy"], 0, 0);
+        let items = vec![copy.clone(), devtools.clone()];
+
+        // Nothing in either visible name contains "inspect", so without alias matching the
+        // answer to this query is an empty list.
+        assert_eq!(rank(&items, "inspect"), vec![(1, 2)]);
+        assert_eq!(rank(&items, "element"), vec![(1, 2)]);
+        assert!(rank(&items, "zoom").is_empty(), "a query that matches no name matches nothing");
+    }
+
+    #[test]
+    fn every_alias_of_a_row_is_searchable_not_just_the_first() {
+        let items = vec![row(
+            &["Quick switcher", "jump to a channel", "server picker"],
+            2,
+            7,
+        )];
+        for query in ["quick", "jump", "picker", "server"] {
+            assert_eq!(rank(&items, query), vec![(2, 7)], "{query} should find the row");
+        }
+    }
+
+    #[test]
+    fn a_match_on_the_visible_name_outranks_the_same_match_on_an_alias() {
+        // "Focus address bar" is drawn, "omnibox" is not. Typing a prefix both rows can reach
+        // has to put the one the user can read at the top.
+        let by_alias = row(&["Focus address bar", "omnibox"], 0, 0);
+        let by_name = row(&["Omni box suggestions"], 0, 1);
+        let items = vec![by_alias.clone(), by_name.clone()];
+        assert_eq!(rank(&items, "omn").first(), Some(&(0, 1)), "the visible name wins the tie");
+        // And a weak alias match cannot outscore any real match on the label.
+        assert_eq!(rank(&items, "address"), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn alias_discount_never_flips_a_match_into_a_non_match() {
+        // A discount that pushed a score below the pass line would make a row unfindable by
+        // the very name it was added for.
+        assert!(best_score(&["Quick switcher", "jump to a channel"], "jump")
+            .is_some());
+        assert!(best_score(&["Quick switcher", "jump to a channel"], "quick").is_some());
     }
 
     #[test]

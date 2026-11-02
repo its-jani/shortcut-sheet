@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::data::{Catalog, Combo, Theme};
 use crate::detect::{self, Context};
-use crate::platform::{self, HookEvent, TargetWindow, TrayEvent};
+use crate::platform::{self, HookEvent, Summon, TargetWindow, TrayEvent};
 use crate::ui::overlay::{Action, KeyFlags, Overlay};
 use crate::ui::{self as uitok, Palette};
 
@@ -30,6 +30,14 @@ pub struct Sheet {
     /// The app the user was in when the overlay came up. Input goes back here.
     target: Option<TargetWindow>,
     target_exe: Option<String>,
+    /// Which of the two trigger modes opened this session, because only one of them ends on
+    /// a key release.
+    summoned: Option<Summon>,
+    /// When the overlay deliberately took the caret. The activation the OS was asked for is
+    /// asynchronous, so "the caret is not here" is not a departure until it has had time to
+    /// land - without this, the click into the search box would dismiss itself on the frame
+    /// after it asked for focus.
+    focused_since: Option<Instant>,
     hwnd: Option<isize>,
     /// So "the window is not there yet" is said once per run, not once per frame.
     warned_no_hwnd: bool,
@@ -46,6 +54,9 @@ pub struct Stats {
     pub shows: u64,
     pub fires: u64,
     pub unsupported: u64,
+    /// Sessions that ended by handing the caret back. The focus promise is the one thing in
+    /// this app that has no visible symptom when it breaks, so it gets a counter.
+    pub hand_backs: u64,
 }
 
 impl Sheet {
@@ -67,6 +78,8 @@ impl Sheet {
             closing: false,
             target: None,
             target_exe: None,
+            summoned: None,
+            focused_since: None,
             hwnd: None,
             warned_no_hwnd: false,
             styled: false,
@@ -104,23 +117,51 @@ impl Sheet {
         }
         for event in batch {
             match event {
-                HookEvent::Show { target } => self.on_show(ctx, TargetWindow(target)),
+                HookEvent::Show { target, via } => self.on_show(ctx, TargetWindow(target), via),
                 HookEvent::Hide => self.on_hide(ctx),
             }
         }
     }
 
-    fn on_show(&mut self, ctx: &egui::Context, target: TargetWindow) {
+    fn on_show(&mut self, ctx: &egui::Context, target: TargetWindow, via: Summon) {
         if self.overlay.is_open() {
-            return; // already up; the hook will not re-arm until the key comes up
+            // A second complete press of the summon chord. What it means depends on where the
+            // user is standing: over the window the sheet is already about, it is the keyboard's
+            // way of putting the sheet away - the only one an instant session has in browse mode,
+            // where no key is being held to release. Over a different window, it is a request for
+            // that app's sheet, and dismissing instead would make the hotkey look dead.
+            //
+            // The UI owns this truth rather than the hook, because a "shown" flag on the hook
+            // side goes stale the moment the panel is dismissed by Escape, by a click, or by
+            // firing a row - and the next press would then do nothing at all.
+            if via != Summon::Chord || self.summoned != Some(Summon::Chord) {
+                return; // already up, and this is not the chord asking for a change
+            }
+            let moved_on = self.target.map(|t| t != target).unwrap_or(false);
+            self.dismiss(ctx);
+            if !moved_on {
+                tracing::debug!("summon chord pressed again over the same window; sheet put away");
+                return;
+            }
+            tracing::debug!("summon chord pressed over another window; showing that app");
         }
         let exe = platform::process_name_of(target);
         match detect::resolve(&self.catalog, exe.as_deref()) {
-            Context::Known(name) => {
+            // Both named cases show a panel. A roster app has no rows, so it shows the empty
+            // state under its own name - "we know this window and have nothing for it yet" has
+            // to look different from "this key does nothing here".
+            Context::Known(name) | Context::Empty(name) => {
                 self.target = Some(target);
                 self.target_exe = exe;
+                self.summoned = Some(via);
                 self.overlay.open(&self.catalog, &name);
                 self.stats.shows += 1;
+                tracing::debug!(
+                    app = %name,
+                    via = ?via,
+                    rows = self.overlay.row_count(),
+                    "overlay shown"
+                );
                 self.place_and_show(ctx, target);
             }
             Context::Unsupported(_) => {
@@ -188,12 +229,14 @@ impl Sheet {
     /// to see S01 from a machine. Lands on the current foreground window, and near the top-left
     /// when there is no window in front at all.
     fn peek_show(&mut self, ctx: &egui::Context, app: &str) {
-        self.overlay.open(&self.catalog, app);
-        if !self.overlay.is_open() {
+        if !self.catalog.knows(app) {
+            // Named on a command line, so a typo is the honest explanation, and the only
+            // useful answer is to say it in the log and leave rather than show a blank panel.
             tracing::error!(app, "--peek named an app that is not in the dataset");
             self.request_quit(ctx);
             return;
         }
+        self.overlay.open(&self.catalog, app);
         self.stats.shows += 1;
         match platform::foreground_window() {
             Some(target) => {
@@ -203,6 +246,7 @@ impl Sheet {
                 // the one thing the overlay promises - could not be measured at all, because the
                 // hook that normally sets `target` ignores injected input by design.
                 self.target = Some(target);
+                self.target_exe = platform::process_name_of(target);
                 self.place_and_show(ctx, target);
             }
             None => {
@@ -255,18 +299,76 @@ impl Sheet {
         if !self.overlay.is_open() {
             return;
         }
-        let was_focused = self.overlay.focused;
+        // The trigger key came up. In browse mode the target never lost the caret, so this is
+        // just a hide; in a focused search session `dismiss` hands the caret back first, which
+        // is the case that used to leave the cursor nowhere.
+        self.dismiss(ctx);
+    }
+
+    /// End the session. Every way out of the overlay goes through here - key release, Escape,
+    /// the close mark, a fired row, a click away - because the promise is the same on each one
+    /// and four copies of it are four places it can be broken.
+    fn dismiss(&mut self, ctx: &egui::Context) {
+        self.give_back_focus();
         self.overlay.close();
+        self.summoned = None;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        if was_focused {
-            self.restore_focus();
-        }
         ctx.request_repaint();
     }
 
-    fn restore_focus(&mut self) {
-        if let Some(t) = self.target {
-            platform::activate(t.0);
+    /// Move the caret back to the window the session came from.
+    ///
+    /// Does nothing unless the overlay actually took the focus. That is not shyness: in browse
+    /// mode the target is still foreground and never stopped being, so touching focus here would
+    /// spend the one thing this product is promising to leave alone.
+    ///
+    /// Idempotent because `target` is *taken*: the fire path and the dismiss path both call this
+    /// and must not activate the same window twice, or hand back to a window the user has since
+    /// left. The ex-style goes back to "never activate" afterwards, so a hidden panel cannot be
+    /// picked up as a focus candidate by whatever the shell does next.
+    fn give_back_focus(&mut self) {
+        if !self.overlay.focused {
+            return;
+        }
+        self.overlay.focused = false;
+        self.focused_since = None;
+        let Some(target) = self.target.take() else {
+            tracing::warn!("focused session ended with no window to hand focus back to");
+            return;
+        };
+        platform::activate(target.0);
+        self.enforce_overlay_style();
+        self.stats.hand_backs += 1;
+        tracing::debug!(hwnd = target.0, exe = ?self.target_exe, "focus handed back to the target");
+    }
+
+    /// True once the window in front has stopped being either the overlay or the app the
+    /// session came from, which means the user is working somewhere else now.
+    ///
+    /// The two modes have different grace. A focused search session is the case where the
+    /// overlay *is* the expected foreground, and the activation it asked for lands a frame or
+    /// two late - so a departure there is only counted after 500 ms, or every click into the
+    /// box would dismiss itself the moment it started. A browse session never expects to be
+    /// foreground at all, so any other window in front is already a move away: that is the half
+    /// that an instant chord summon needs, because a chord press has no key release to hide on.
+    fn left_the_session(&self) -> bool {
+        let Some(front) = platform::foreground_window() else {
+            return false;
+        };
+        if self.overlay.focused {
+            let (Some(hwnd), Some(since)) = (self.hwnd, self.focused_since) else {
+                return false;
+            };
+            front.0 != hwnd && since.elapsed() > Duration::from_millis(500)
+        } else {
+            // Browse mode. The app the session came from is the expected foreground, and our
+            // own window showing up there is winit's doing rather than the user's - that is
+            // what the per-frame ex-style re-assertion exists to fix - so only a *third* window
+            // in front counts as the user having moved on.
+            let Some(target) = self.target else {
+                return false;
+            };
+            front.0 != target.0 && Some(front.0) != self.hwnd
         }
     }
 
@@ -283,6 +385,7 @@ impl Sheet {
                 shows = self.stats.shows,
                 fires = self.stats.fires,
                 unsupported = self.stats.unsupported,
+                hand_backs = self.stats.hand_backs,
                 "quitting from the tray"
             );
             self.request_quit(ctx);
@@ -298,6 +401,7 @@ impl Sheet {
             shows = self.stats.shows,
             fires = self.stats.fires,
             unsupported = self.stats.unsupported,
+            hand_backs = self.stats.hand_backs,
             "fired"
         );
     }
@@ -324,6 +428,11 @@ impl eframe::App for Sheet {
             // Leaving. If the handle is not known yet this keeps trying, slowly, because a
             // resident app with no window and no quit is an app the user has to kill in
             // Task Manager.
+            if self.overlay.focused {
+                // Do not quit out from under a window that is holding our caret: give it back
+                // first, then close, so the last thing the run does is the promise.
+                self.give_back_focus();
+            }
             if !self.try_close() {
                 ctx.request_repaint_after(Duration::from_millis(120));
             }
@@ -334,6 +443,17 @@ impl eframe::App for Sheet {
                 self.request_quit(&ctx);
                 return;
             }
+        }
+        // The user has moved on: another window is in front, so the sheet is now just something
+        // floating over somebody else's work. Dismiss it without touching focus, because focus
+        // is already where the user is.
+        if self.overlay.is_open() && self.left_the_session() {
+            tracing::debug!("the foreground moved elsewhere; dismissing the sheet");
+            self.overlay.focused = false;
+            self.focused_since = None;
+            self.target = None;
+            self.dismiss(&ctx);
+            return;
         }
         // Theme follows the OS unless the settings file says otherwise, and cheaply: only
         // re-read while hidden.
@@ -372,25 +492,39 @@ impl eframe::App for Sheet {
                 // which row the user chose.
                 let app = self.overlay.app.clone();
                 let entry = self.overlay.selected_entry(&self.catalog);
+                // Then the order that decides where the chord actually lands. SendInput goes to
+                // whatever holds the caret, and on the Enter path that is our own search box:
+                // handing the caret back first is what makes the app receive the shortcut it was
+                // chosen for. The three exits that fire a row - Enter, arrows then Enter, and a
+                // click - are one code path here, so all three get it or none of them do.
+                self.give_back_focus();
                 if let (Some(app), Some((collection, command))) = (app, entry) {
                     self.catalog.record_learnt(&app, &collection, &command);
                 }
                 self.fire(c);
-                self.on_hide(&ctx);
+                self.dismiss(&ctx);
             }
             Action::WantFocus => {
                 self.overlay.focused = true;
+                self.focused_since = Some(Instant::now());
                 self.ensure_hwnd();
                 if let Some(h) = self.hwnd {
-                    tracing::debug!(hwnd = h, "overlay takes focus for the search box");
+                    // The one deliberate focus change in the product.
+                    tracing::debug!(
+                        hwnd = h,
+                        target = ?self.target.map(|t| t.0),
+                        "overlay takes focus for the search box"
+                    );
                     platform::activate(h);
                 }
             }
             Action::GiveUpFocus => {
-                self.overlay.focused = false;
+                // Escape, or the drawn X. `dismiss` sees that the session still holds the caret
+                // and hands it back before hiding, which is the order the hand-back needs: the
+                // target must still exist and the overlay must still be the window giving focus
+                // up. In browse mode nothing holds the caret and this is just a hide.
                 tracing::debug!("overlay hands focus back and hides");
-                self.restore_focus();
-                self.on_hide(&ctx);
+                self.dismiss(&ctx);
             }
         }
 

@@ -15,6 +15,9 @@
   "defaults": {
     "trigger": "ctrl",
     "hold_ms": 1500,
+    "long_press_enabled": true,
+    "instant_enabled": false,
+    "instant_hotkey": "Win+Alt",
     "theme": "system",
     "fade": 0.04,
     "run_on_startup": false,

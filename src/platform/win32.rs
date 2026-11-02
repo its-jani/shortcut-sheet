@@ -323,20 +323,89 @@ fn key_event(key: Key, up: bool) -> INPUT {
 /// What the hook decides. Rare by design: one event per hold, not per keystroke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
-    Show { target: isize },
+    Show { target: isize, via: Summon },
     Hide,
 }
+
+/// Which of the two trigger modes summoned the sheet, because they end differently.
+///
+/// Evidence: the target's own `KeyboardShortcut` setting carries both at once - a long-press
+/// key with a delay, and a chord that fires instantly (`StaticShortcutKeys: [91, 18]`, i.e.
+/// Win+Alt). A hold hides when the key comes up; a chord press has no "comes up" to wait for,
+/// so it stays until the user leaves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Summon {
+    /// The trigger key was held past the threshold. Released ends the session.
+    Hold,
+    /// The summon chord completed. No key release ends it.
+    Chord,
+}
+
+/// What the hook is told to watch for. Plain numbers and flags, so this layer never has to
+/// know that a settings file exists.
+#[derive(Debug, Clone)]
+pub struct HookConfig {
+    /// The long-press key.
+    pub trigger_vk: u32,
+    /// How long it must be held.
+    pub hold: Duration,
+    /// False makes the trigger key an ordinary key: the mode is off in the settings.
+    pub long_press: bool,
+    /// The instant summon chord. Empty means the instant mode is off.
+    pub chord: Vec<u32>,
+}
+
+/// How many keys a summon chord can watch. The observed configurations top out at three
+/// (Win+Alt+`); a fixed array is what lets the hook proc stay allocation-free.
+const MAX_CHORD: usize = 4;
 
 /// State the proc and the 50 ms timer share. Both run on the hook thread, so a
 /// thread-local is enough and no lock is needed anywhere on the input path.
 struct HoldState {
     trigger_vk: u32,
     hold: Duration,
+    long_press: bool,
+    /// The summon chord, and which of its keys are down right now.
+    chord: [u32; MAX_CHORD],
+    chord_len: usize,
+    chord_down: [bool; MAX_CHORD],
     armed: bool,
     held: bool,
     shown: bool,
     since: Instant,
     sink: Sender<HookEvent>,
+}
+
+impl HoldState {
+    fn new(cfg: HookConfig, sink: Sender<HookEvent>) -> Self {
+        let mut chord = [0u32; MAX_CHORD];
+        let len = cfg.chord.len().min(MAX_CHORD);
+        chord[..len].copy_from_slice(&cfg.chord[..len]);
+        if cfg.chord.len() > len {
+            tracing::warn!(
+                hotkey = ?cfg.chord,
+                watched = len,
+                "summon chord is longer than the hook can watch; the extra keys are ignored"
+            );
+        }
+        Self {
+            trigger_vk: cfg.trigger_vk,
+            hold: cfg.hold,
+            long_press: cfg.long_press,
+            chord,
+            chord_len: len,
+            chord_down: [false; MAX_CHORD],
+            armed: false,
+            held: false,
+            shown: false,
+            since: Instant::now(),
+            sink,
+        }
+    }
+
+    fn chord_complete(&self) -> bool {
+        (0..self.chord_len).all(|i| self.chord_down[i])
+    }
 }
 
 thread_local! {
@@ -361,7 +430,11 @@ unsafe extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                     let down = wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
                     let up = wparam.0 as u32 == WM_KEYUP || wparam.0 as u32 == WM_SYSKEYUP;
                     if down || up {
-                        evaluate(st, info.vkCode, down);
+                        // Decide, then deliver. Two calls rather than one nested expression,
+                        // because the split is the whole testability argument: `evaluate` is the
+                        // rule set, `deliver` is the part that needs a real desktop.
+                        let request = evaluate(st, info.vkCode, down);
+                        deliver(st, request);
                     }
                 }
             });
@@ -372,30 +445,77 @@ unsafe extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
     CallNextHookEx(None, code, wparam, lparam)
 }
 
-/// One transition of the hold state machine. Split out from `proc` so the timing rules
-/// are readable and testable.
-fn evaluate(st: &mut HoldState, vk: u32, down: bool) {
+/// One transition of the trigger state machine, with the clock and the foreground window
+/// kept out of it: this is the half the tests drive.
+///
+/// Two modes run through the same key stream, which is why the order here matters:
+///
+/// 1. A completed summon chord wins immediately, even mid-hold. Win+Alt is a chord that can
+///    contain the long-press key (Ctrl is the stock trigger *and* the stock chord), and a
+///    summon the hold logic swallowed would look like a hotkey that does not work.
+/// 2. The long-press key arms or ends a hold.
+/// 3. Anything else that goes down while a hold is armed cancels it.
+fn evaluate(st: &mut HoldState, vk: u32, down: bool) -> Request {
+    let chord_index = (0..st.chord_len).find(|i| st.chord[*i] == vk);
+    // Only the transition into down can complete a chord: a held key autorepeats, and a
+    // repeat that re-summoned the sheet would fight the user's own keystrokes.
+    let was_down = chord_index.map(|i| st.chord_down[i]).unwrap_or(false);
+    if let Some(i) = chord_index {
+        st.chord_down[i] = down;
+    }
+
+    if down && !was_down && chord_index.is_some() && st.chord_len > 1 && st.chord_complete() {
+        // The hold that may be running is not a lookup any more; this was a summon.
+        st.armed = false;
+        return Request::Show(Summon::Chord);
+    }
+
     if vk == st.trigger_vk {
         if down {
-            if !st.held {
+            if !st.held && st.long_press {
                 st.held = true;
                 st.armed = true;
                 st.since = Instant::now();
             }
         } else {
             st.held = false;
+            st.armed = false;
             if st.shown {
                 st.shown = false;
-                let _ = st.sink.send(HookEvent::Hide);
+                return Request::Hide;
             }
-            st.armed = false;
         }
-        return;
+        return Request::None;
     }
     if down && st.armed {
         // Any other key while the trigger is held is a real shortcut being typed, not a
         // lookup. Without this rule every Ctrl+C pops the overlay over the user's work.
         st.armed = false;
+    }
+    Request::None
+}
+
+/// What a key transition decided to do. Kept apart from the delivery because `Show` needs a
+/// foreground window, which is the one thing a unit test cannot hand it.
+#[derive(Debug, PartialEq, Eq)]
+enum Request {
+    Show(Summon),
+    Hide,
+    None,
+}
+
+/// The half of the decision that talks to Windows and to the UI thread.
+fn deliver(st: &mut HoldState, request: Request) {
+    match request {
+        Request::Show(via) => {
+            if let Some(target) = foreground_window() {
+                let _ = st.sink.send(HookEvent::Show { target: target.0, via });
+            }
+        }
+        Request::Hide => {
+            let _ = st.sink.send(HookEvent::Hide);
+        }
+        Request::None => {}
     }
 }
 
@@ -405,7 +525,9 @@ fn tick(st: &mut HoldState) {
     if hold_elapsed(st, Instant::now()) {
         if let Some(target) = foreground_window() {
             st.shown = true;
-            let _ = st.sink.send(HookEvent::Show { target: target.0 });
+            let _ = st
+                .sink
+                .send(HookEvent::Show { target: target.0, via: Summon::Hold });
         }
     }
 }
@@ -419,24 +541,17 @@ fn hold_elapsed(st: &HoldState, now: Instant) -> bool {
         && now.saturating_duration_since(st.since) >= st.hold
 }
 
-/// Spawn the hook thread. Returns the receiving end of its decision stream and a join
-/// handle; the hook stays installed until the thread exits.
-pub fn spawn_hook(trigger_vk: u32, hold: Duration) -> std::sync::mpsc::Receiver<HookEvent> {
+/// Spawn the hook thread. Returns the receiving end of its decision stream; the hook stays
+/// installed until the thread exits.
+pub fn spawn_hook(cfg: HookConfig) -> std::sync::mpsc::Receiver<HookEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
+    let log_trigger = cfg.trigger_vk;
+    let log_hold = cfg.hold.as_millis();
+    let log_chord = cfg.chord.clone();
     std::thread::Builder::new()
         .name("ss-hook".into())
         .spawn(move || {
-            STATE.with(|s| {
-                *s.borrow_mut() = Some(HoldState {
-                    trigger_vk,
-                    hold,
-                    armed: false,
-                    held: false,
-                    shown: false,
-                    since: Instant::now(),
-                    sink: tx,
-                })
-            });
+            STATE.with(|s| *s.borrow_mut() = Some(HoldState::new(cfg, tx)));
 
             // SAFETY: a thread-local hook (hMod NULL, dwThreadId 0) is valid for
             // WH_KEYBOARD_LL and is removed by UnhookWindowsHookEx below. `proc` matches
@@ -453,7 +568,12 @@ pub fn spawn_hook(trigger_vk: u32, hold: Duration) -> std::sync::mpsc::Receiver<
                     return;
                 }
             };
-            tracing::info!(trigger_vk, hold_ms = hold.as_millis(), "global keyboard hook installed");
+            tracing::info!(
+                trigger_vk = log_trigger,
+                hold_ms = log_hold,
+                chord = ?log_chord,
+                "global keyboard hook installed"
+            );
 
             // A thread timer, because GetMessageW would otherwise sleep straight through
             // the hold threshold.
@@ -684,23 +804,57 @@ mod tests {
     use std::sync::mpsc::Receiver;
 
     const CTRL: u32 = 0x11;
+    const ALT: u32 = 0x12;
+    const WIN: u32 = 0x5B;
     const C: u32 = 0x43;
 
     /// The hold machine driven by hand. No hook is installed and no window is touched -
     /// `evaluate` and `hold_elapsed` are pure, which is the whole point of splitting them
-    /// out of `proc` and `tick`.
-    fn machine(hold_ms: u64) -> (HoldState, Receiver<HookEvent>) {
+    /// out of `proc`, `tick` and `deliver`.
+    fn build(cfg: HookConfig) -> (HoldState, Receiver<HookEvent>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let st = HoldState {
+        (HoldState::new(cfg, tx), rx)
+    }
+
+    fn machine(hold_ms: u64) -> (HoldState, Receiver<HookEvent>) {
+        build(HookConfig {
             trigger_vk: CTRL,
             hold: Duration::from_millis(hold_ms),
-            armed: false,
-            held: false,
-            shown: false,
-            since: Instant::now(),
-            sink: tx,
-        };
-        (st, rx)
+            long_press: true,
+            chord: Vec::new(),
+        })
+    }
+
+    /// Both modes on, which is what the target's setting allows and what the recorded user
+    /// eventually had: a hold that can also be interrupted by a chord.
+    fn with_chord(hold_ms: u64, chord: &[u32]) -> (HoldState, Receiver<HookEvent>) {
+        build(HookConfig {
+            trigger_vk: CTRL,
+            hold: Duration::from_millis(hold_ms),
+            long_press: true,
+            chord: chord.to_vec(),
+        })
+    }
+
+    /// Instant only - the configuration the recording ends in: `LongPressShortcutEnabled:
+    /// false`, `StaticShortcutEnabled: true`, `StaticShortcutKeys: [91, 18]`.
+    fn chord_only(chord: &[u32]) -> (HoldState, Receiver<HookEvent>) {
+        build(HookConfig {
+            trigger_vk: CTRL,
+            hold: Duration::from_millis(1500),
+            long_press: false,
+            chord: chord.to_vec(),
+        })
+    }
+
+    /// One key going down, as `proc` hands it to the machine.
+    fn press(st: &mut HoldState, vk: u32) -> Request {
+        evaluate(st, vk, true)
+    }
+
+    /// ...and coming up.
+    fn release(st: &mut HoldState, vk: u32) -> Request {
+        evaluate(st, vk, false)
     }
 
     /// The timing rule at an offset from the moment the key went down.
@@ -715,7 +869,7 @@ mod tests {
     #[test]
     fn a_bare_hold_shows_exactly_at_the_threshold() {
         let (mut st, rx) = machine(900);
-        evaluate(&mut st, CTRL, true);
+        assert_eq!(press(&mut st, CTRL), Request::None);
         assert!(!ready_at(&st, 0), "no popup the instant the key goes down");
         assert!(!ready_at(&st, 899), "and none a millisecond before the threshold");
         assert!(ready_at(&st, 900), "the overlay appears once the hold is long enough");
@@ -727,8 +881,8 @@ mod tests {
         // The common case: Ctrl pressed and released on the way to Ctrl+C. F01's edge case
         // "key released before the threshold" - the answer must be no overlay at all.
         let (mut st, rx) = machine(900);
-        evaluate(&mut st, CTRL, true);
-        evaluate(&mut st, CTRL, false);
+        press(&mut st, CTRL);
+        assert_eq!(release(&mut st, CTRL), Request::None, "nothing was shown, so nothing to hide");
         assert!(!ready_at(&st, 5000), "a released hold cannot come back later");
         assert!(fired(&rx).is_empty(), "nothing to hide, so no Hide either");
     }
@@ -737,11 +891,20 @@ mod tests {
     fn typing_a_real_shortcut_while_held_disarms_the_hold() {
         // Without this rule every Ctrl+C the user types would pop the sheet over the result.
         let (mut st, rx) = machine(900);
-        evaluate(&mut st, CTRL, true);
-        evaluate(&mut st, C, true);
+        press(&mut st, CTRL);
+        press(&mut st, C);
         assert!(!ready_at(&st, 3000), "an interrupted hold is not a lookup");
-        evaluate(&mut st, CTRL, false);
+        assert_eq!(release(&mut st, CTRL), Request::None);
         assert!(fired(&rx).is_empty());
+    }
+
+    #[test]
+    fn an_unwatched_key_still_interrupts_a_hold() {
+        // The summon chord being off must not turn Win into a key the hold ignores.
+        let (mut st, _rx) = machine(900);
+        press(&mut st, CTRL);
+        assert_eq!(press(&mut st, WIN), Request::None, "no chord is configured, so no summon");
+        assert!(!ready_at(&st, 3000), "but it is still an interruption");
     }
 
     #[test]
@@ -749,18 +912,18 @@ mod tests {
         // Holding Ctrl+C keeps repeating both VK_KEYDOWNs. The repeat of Ctrl must not
         // restart the timer, or the sheet appears on top of the copy the user just made.
         let (mut st, _rx) = machine(900);
-        evaluate(&mut st, CTRL, true);
-        evaluate(&mut st, C, true);
-        evaluate(&mut st, CTRL, true);
+        press(&mut st, CTRL);
+        press(&mut st, C);
+        press(&mut st, CTRL);
         assert!(!ready_at(&st, 3000));
     }
 
     #[test]
     fn an_ongoing_hold_survives_key_repeats() {
         let (mut st, _rx) = machine(900);
-        evaluate(&mut st, CTRL, true);
+        press(&mut st, CTRL);
         let since = st.since;
-        evaluate(&mut st, CTRL, true);
+        press(&mut st, CTRL);
         assert_eq!(st.since, since, "a repeat must not reset the hold clock");
         assert!(ready_at(&st, 900));
     }
@@ -768,23 +931,106 @@ mod tests {
     #[test]
     fn releasing_after_a_show_hides_once() {
         let (mut st, rx) = machine(900);
-        evaluate(&mut st, CTRL, true);
+        press(&mut st, CTRL);
         st.shown = true; // what `tick` does when it sends Show
-        evaluate(&mut st, CTRL, false);
+        let decided = release(&mut st, CTRL);
+        assert_eq!(decided, Request::Hide);
+        deliver(&mut st, decided); // the half that also runs in `proc`
         assert_eq!(fired(&rx), vec![HookEvent::Hide]);
-        // A stray repeat of the key-up must not send a second Hide. (Note `fired` drains
-        // the queue, so the read above is what empties it.)
-        evaluate(&mut st, CTRL, false);
-        assert!(fired(&rx).is_empty(), "one hide per hold");
+        // A stray repeat of the key-up must not send a second Hide. (`fired` drains the
+        // queue, so the read above is what empties it.)
+        assert_eq!(release(&mut st, CTRL), Request::None, "one hide per hold");
     }
 
     #[test]
     fn keys_without_the_trigger_do_nothing() {
         let (mut st, rx) = machine(900);
-        evaluate(&mut st, C, true);
-        evaluate(&mut st, C, false);
+        press(&mut st, C);
+        release(&mut st, C);
         assert!(!st.held && !st.armed && !st.shown);
         assert!(fired(&rx).is_empty());
+    }
+
+    // -- the instant trigger ---------------------------------------------------------------
+
+    #[test]
+    fn half_a_chord_summon_nothing_and_a_whole_chord_summons_at_once() {
+        let (mut st, rx) = with_chord(900, &[WIN, ALT]);
+        assert_eq!(
+            press(&mut st, WIN),
+            Request::None,
+            "the first key of a chord is not a summon"
+        );
+        assert_eq!(press(&mut st, ALT), Request::Show(Summon::Chord), "no hold, no delay");
+        assert!(fired(&rx).is_empty(), "deciding is not delivering; delivery needs a window");
+    }
+
+    #[test]
+    fn letting_go_of_a_chord_does_not_hide_the_sheet() {
+        // The difference between the two modes, and the reason they cannot share one flag:
+        // a hold ends when the key comes up, a chord press has no "comes up" to wait for.
+        // The recorded session shows the point - Win+Alt, then a search typed while both keys
+        // are long released.
+        let (mut st, _rx) = chord_only(&[WIN, ALT]);
+        press(&mut st, WIN);
+        assert_eq!(press(&mut st, ALT), Request::Show(Summon::Chord));
+        assert_eq!(release(&mut st, WIN), Request::None);
+        assert_eq!(release(&mut st, ALT), Request::None, "nothing here ends the session");
+    }
+
+    #[test]
+    fn a_chord_can_be_summoned_again_after_being_let_go() {
+        let (mut st, _rx) = chord_only(&[WIN, ALT]);
+        press(&mut st, WIN);
+        press(&mut st, ALT);
+        release(&mut st, ALT);
+        release(&mut st, WIN);
+        assert_eq!(press(&mut st, WIN), Request::None);
+        assert_eq!(press(&mut st, ALT), Request::Show(Summon::Chord), "the hook never latches");
+    }
+
+    #[test]
+    fn a_repeated_chord_key_does_not_summon_twice() {
+        // Autorepeat arrives as another key-down. Re-summoning on it would be harmless to the
+        // UI and fatal to a session the user is typing into.
+        let (mut st, _rx) = with_chord(900, &[WIN, ALT]);
+        press(&mut st, WIN);
+        assert_eq!(press(&mut st, ALT), Request::Show(Summon::Chord));
+        assert_eq!(press(&mut st, ALT), Request::None, "only the transition into down counts");
+        assert_eq!(press(&mut st, WIN), Request::None, "and the other key is already down");
+    }
+
+    #[test]
+    fn a_chord_that_contains_the_trigger_key_wins_over_the_hold() {
+        // Ctrl is the stock long-press key and the stock instant chord. Pressing Ctrl then
+        // Alt has to summon, and must not leave a half-hold armed afterwards.
+        let (mut st, _rx) = with_chord(900, &[CTRL, ALT]);
+        press(&mut st, CTRL);
+        assert!(st.armed, "the hold starts as always");
+        assert_eq!(press(&mut st, ALT), Request::Show(Summon::Chord));
+        assert!(!st.armed, "the gesture was a summon, not a lookup");
+        assert!(!ready_at(&st, 60_000), "and there is no hold left to fire later");
+    }
+
+    #[test]
+    fn switching_the_hold_mode_off_makes_the_trigger_key_an_ordinary_key() {
+        let (mut st, _rx) = chord_only(&[WIN, ALT]);
+        assert_eq!(press(&mut st, CTRL), Request::None);
+        assert!(!st.held && !st.armed, "long-press is off in the settings");
+        assert!(!ready_at(&st, 60_000), "so a bare hold never shows the sheet");
+    }
+
+    #[test]
+    fn an_over_long_chord_is_truncated_rather_than_dropping_the_mode() {
+        // The hook may not allocate, so the chord is a fixed array. Five keys is already a
+        // chord nobody can hold; watch what fits and say so in the log.
+        let (mut st, _rx) = chord_only(&[0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(st.chord_len, MAX_CHORD, "the hook watches four keys");
+        for vk in [0x01u32, 0x02, 0x03] {
+            assert_eq!(press(&mut st, vk), Request::None, "three of the four watched keys down");
+        }
+        assert_eq!(press(&mut st, 0x04), Request::Show(Summon::Chord), "the watched four complete");
+        assert_eq!(press(&mut st, 0x05), Request::None, "the fifth key is not watched");
     }
 
     #[test]
