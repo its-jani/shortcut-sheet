@@ -1,0 +1,50 @@
+# CtrlHelp Rust Replica — v0.4.0
+
+High-performance Rust/egui clean-room replacement for CtrlHelp. This tag is the parity baseline:
+every must-have feature in `replica/features.csv` is done and measured, not estimated.
+
+## Core features and parity baseline (75.4 % overall / 100 % must-haves)
+
+- **Token-driven overlay — 100 % parity.** Measured surface metrics, light and dark themes, and
+  Win32 extended styles (`WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`) re-asserted every
+  frame, because winit rewrites them on any window-state change. `egui::Visuals` is built from the
+  design tokens rather than swapped for one of egui's two stock themes.
+- **Dual-trigger hotkey engine.** Long-press summon on a configurable key (default `Ctrl`, 1500 ms)
+  alongside an instant modifier chord (default `Win+Alt`). A chord has no key-release to hide on, so
+  a second complete press puts the sheet away — the only dismiss an instant session has in browse
+  mode. Note: `instant_enabled` ships `false`; set it in `settings.json` to turn the chord on.
+- **Fuzzy alias matching.** `Shortcut.aliases` gives each row extra search names, ranked with a
+  discount so a match on the visible name still outranks the same match on a name the user cannot
+  see. `alias_discount_never_flips_a_match_into_a_non_match` pins the floor.
+- **Precision focus hand-back.** `give_back_focus()` restores the saved foreground window before
+  `SendInput` runs, on all three exits — Enter, Arrow+Enter and Escape. Measured with the foreground
+  window read before the panel opens and again after it closes, not inferred from the code.
+- **App and roster detection.** Active-process resolution mapping against 26 profile schemas and 64
+  roster entries, 511 shortcuts in total.
+
+## Verification and quality gates
+
+- **Unit tests:** 96 passed, 0 failed, warning-free release build.
+- **Palette drift gate:** `the_palette_mirrors_the_token_file` reads `replica/design/tokens.json`
+  back at test time and fails the build when a mirrored value drifts. A file-equality check, not a
+  hash — see `replica/design/tokens.json` if you want the exact comparison.
+- **WCAG AA:** 37 contrast pairs validated in `tokens.json → pairs`.
+- **Feature parity:** `python .qoder/skills/replica-diff/parity.py replica/features.csv` scores
+  75.4 / 100 with must-haves 14 of 14. Overlay and shell areas are at 100 %.
+
+## Known open items
+
+Recorded in `replica/bugs.md` rather than hidden:
+
+- **BUG-006** idle memory is 64 MB private against the relaxed ~60 MB budget. The original 15 MB
+  figure belongs to a non-GPU overlay; that trade was made deliberately when egui was chosen.
+- **BUG-007** the overlay repaints at ~55 fps while it is open.
+- **BUG-010** `fade`, `max_rows` and `run_on_startup` are still parsed and ignored.
+- **BUG-013** the panel keeps its show-time height after a search shrinks the list.
+- **BUG-009** the physical key-hold latency budget cannot be driven from a script — the hook
+  rejects injected input on purpose — so it needs a human run.
+
+## Binary
+
+`shortcut-sheet.exe` — release build, `x86_64-pc-windows-msvc`, portable, no installer, no
+runtime dependency. Data lives in `%LOCALAPPDATA%\shortcut-sheet`.
