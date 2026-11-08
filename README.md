@@ -186,8 +186,10 @@ Three threads, one direction of data flow, no shared mutable state:
 
 - The **hook proc** only pokes a thread-local state machine and sends. Bounded channel with
   `try_send` means a stalled UI drops stale events instead of replaying old overlays.
-- The **UI thread** polls the receiver each frame and drives show/hide. Idle polling runs at
-  ~8 Hz while hidden; the trigger path itself stays instant.
+- The **UI thread** drains the receiver on the frames it runs. While the panel is hidden that is a
+  ~8 Hz poll; while it is open there is no poll at all — the hook, the tray and a
+  foreground-change watch wake the loop instead, and an idle panel paints 0 frames a second. The
+  trigger path itself stays instant either way.
 - The overlay window is **created once and hidden**, never destroyed — showing a hidden
   window is a repaint, whereas creating one on the trigger would blow the latency budget on
   first press.

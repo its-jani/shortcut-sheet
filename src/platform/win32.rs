@@ -5,6 +5,7 @@
 
 use std::mem::size_of;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
@@ -13,8 +14,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext,
                                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -29,15 +32,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, GetForegroundWindow,
     GetWindowLongPtrW, GetCursorPos, GetWindowRect, GetWindowThreadProcessId, KillTimer,
-    LLMHF_INJECTED, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
-    TrackPopupMenu, UnhookWindowsHookEx, CS_CLASSDC, GWL_EXSTYLE,
+    LLMHF_INJECTED, LoadIconW, PostMessageW, PostQuitMessage, PostThreadMessageW,
+    RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowsHookExW, ShowWindow, TranslateMessage, TrackPopupMenu, UnhookWindowsHookEx,
+    CS_CLASSDC, EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE,
     HC_ACTION, HWND_MESSAGE, IDI_APPLICATION, KBDLLHOOKSTRUCT, MF_STRING, MSG, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE,
     TPM_RIGHTBUTTON, WH_KEYBOARD_LL, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN,
     WM_KEYUP, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_OVERLAPPED,
+    WINEVENT_OUTOFCONTEXT, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_OVERLAPPED,
 };
 
 use crate::data::key::{Combo, Key};
@@ -341,6 +345,69 @@ pub enum Summon {
     Chord,
 }
 
+/// The closure the UI hands over: "wake the event loop". Named, because the slot it lives in
+/// is hard enough to read with the trait object spelled out inline.
+type WakeFn = Box<dyn Fn() + Send + Sync>;
+
+/// A thread-safe "come back and run a frame" for the UI thread.
+///
+/// The hook and the tray threads are spawned before `eframe::run_native` exists - the first
+/// Ctrl press has to work while the window is still being built - so they cannot hold an
+/// `egui::Context`. They hold this instead: an empty slot the first UI frame fills, and a
+/// no-op until it is filled. Waking from another thread is what `Context::request_repaint`
+/// is for, and eframe forwards it to winit's `EventLoopProxy`; that is the piece that lets
+/// an open panel stop repainting to find out whether something happened (BUG-007).
+#[derive(Clone, Default)]
+pub struct UiWake {
+    wake: Arc<Mutex<Option<WakeFn>>>,
+}
+
+impl UiWake {
+    /// Install the real wake. Idempotent, because the UI calls it every frame and only the
+    /// first call has anything to do.
+    pub fn attach(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let mut slot = self.slot();
+        if slot.is_none() {
+            *slot = Some(Box::new(wake));
+        }
+    }
+
+    /// Ask for a frame. Does nothing before the first frame has run, which is the window
+    /// where the UI is busy painting frames anyway.
+    pub fn wake(&self) {
+        let slot = self.slot();
+        if let Some(wake) = slot.as_ref() {
+            wake();
+        }
+    }
+
+    /// Poison here means some other thread panicked while holding the slot, not that the wake
+    /// is broken - and losing the wake would leave the overlay deaf to the only events it
+    /// cannot poll for any more.
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<WakeFn>> {
+        self.wake.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// What the hook thread's own message loop listens for. `WM_APP + 2` because the tray thread
+/// already claimed `WM_APP + 1` on its queue, and the two are separate queues anyway.
+const WM_WAKE_UI: u32 = WM_APP + 2;
+
+/// Hand the wake to this thread's message loop instead of calling the UI from a callback.
+///
+/// The keyboard callback in particular has no business taking a lock: a low-level hook that
+/// outruns LowLevelHooksTimeout is silently uninstalled by Windows, and `egui::Context`
+/// is lock-backed. A post to one's own queue is neither, so the callback stays cheap and the
+/// loop - which has no deadline - does the wake.
+fn wake_our_message_loop() {
+    // SAFETY: posting to the current thread's own queue from a callback running on it.
+    // The result is ignored on purpose: a full queue already holds an identical wake, and
+    // one of them is enough.
+    unsafe {
+        let _ = PostThreadMessageW(GetCurrentThreadId(), WM_WAKE_UI, WPARAM(0), LPARAM(0));
+    }
+}
+
 /// What the hook is told to watch for. Plain numbers and flags, so this layer never has to
 /// know that a settings file exists.
 #[derive(Debug, Clone)]
@@ -435,6 +502,12 @@ unsafe extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                         // rule set, `deliver` is the part that needs a real desktop.
                         let request = evaluate(st, info.vkCode, down);
                         deliver(st, request);
+                        if request != Request::None {
+                            // The UI used to find this out by repainting 55 times a second.
+                            // It now asks to be told, so say it here - without a lock, and
+                            // without touching anything the timeout budget is meant to protect.
+                            wake_our_message_loop();
+                        }
                     }
                 }
             });
@@ -496,8 +569,9 @@ fn evaluate(st: &mut HoldState, vk: u32, down: bool) -> Request {
 }
 
 /// What a key transition decided to do. Kept apart from the delivery because `Show` needs a
-/// foreground window, which is the one thing a unit test cannot hand it.
-#[derive(Debug, PartialEq, Eq)]
+/// foreground window, which is the one thing a unit test cannot hand it. `Copy` because the
+/// hook callback reads it twice: once to deliver, once to decide whether to wake the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Request {
     Show(Summon),
     Hide,
@@ -520,16 +594,21 @@ fn deliver(st: &mut HoldState, request: Request) {
 }
 
 /// Timer tick: the hook only fires on input, so a user holding Ctrl with no other
-/// keystroke would never get the overlay without this.
-fn tick(st: &mut HoldState) {
-    if hold_elapsed(st, Instant::now()) {
-        if let Some(target) = foreground_window() {
-            st.shown = true;
-            let _ = st
-                .sink
-                .send(HookEvent::Show { target: target.0, via: Summon::Hold });
-        }
+/// keystroke would never get the overlay without this. Returns whether it just summoned
+/// one, which is the half the caller has to hand to the UI thread.
+fn tick(st: &mut HoldState) -> bool {
+    if !hold_elapsed(st, Instant::now()) {
+        return false;
     }
+    let Some(target) = foreground_window() else {
+        return false;
+    };
+    st.shown = true;
+    // Whether the UI actually got the event is what the caller needs to know: a closed channel
+    // means there is nothing worth waking it for.
+    st.sink
+        .send(HookEvent::Show { target: target.0, via: Summon::Hold })
+        .is_ok()
 }
 
 /// The timing rule on its own, with the clock handed in. `tick` is the half that talks to
@@ -543,7 +622,11 @@ fn hold_elapsed(st: &HoldState, now: Instant) -> bool {
 
 /// Spawn the hook thread. Returns the receiving end of its decision stream; the hook stays
 /// installed until the thread exits.
-pub fn spawn_hook(cfg: HookConfig) -> std::sync::mpsc::Receiver<HookEvent> {
+///
+/// `wake` is how this thread tells the UI that the stream has something in it. Without it the
+/// open panel would have to keep repainting to look (BUG-007), and a hidden panel would be
+/// stuck polling at 8 Hz forever for a press that may never come.
+pub fn spawn_hook(cfg: HookConfig, wake: UiWake) -> std::sync::mpsc::Receiver<HookEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
     let log_trigger = cfg.trigger_vk;
     let log_hold = cfg.hold.as_millis();
@@ -575,6 +658,34 @@ pub fn spawn_hook(cfg: HookConfig) -> std::sync::mpsc::Receiver<HookEvent> {
                 "global keyboard hook installed"
             );
 
+            // The keyboard hook says nothing about the *mouse*. A click into another window is
+            // the other way a session ends - the sheet should not sit on top of somebody
+            // else's work - and until now the open panel found that out by asking every frame.
+            // This is the same question with an event under it. Out-of-context means the
+            // callback is delivered through our own message loop: nothing is injected into
+            // another process, and there is no timeout budget to protect here.
+            //
+            // SAFETY: `foreground_proc` matches WINEVENTPROC, and a NULL module with
+            // idProcess = idThread = 0 watches every process on this desktop.
+            let watch = unsafe {
+                SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND,
+                    None,
+                    Some(foreground_proc),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
+            if watch.0.is_null() {
+                // Losing this costs one behaviour - the click-away dismissal - not the app.
+                tracing::warn!(err = ?windows::core::Error::from_thread(),
+                    "could not watch for foreground changes; the sheet will not hide when you click elsewhere");
+            } else {
+                tracing::debug!("foreground-change watch installed");
+            }
+
             // A thread timer, because GetMessageW would otherwise sleep straight through
             // the hold threshold.
             const TIMER_ID: usize = 0x5501;
@@ -589,14 +700,27 @@ pub fn spawn_hook(cfg: HookConfig) -> std::sync::mpsc::Receiver<HookEvent> {
                 if ret.0 <= 0 || msg.message == WM_QUIT {
                     break;
                 }
+                if msg.message == WM_WAKE_UI {
+                    // Something arrived that the UI thread owns: a hook decision, or the
+                    // foreground moving elsewhere. This thread only says "come back"; reading
+                    // the channel stays the UI's job, because handling it mutates the window.
+                    wake.wake();
+                    continue;
+                }
                 if msg.message == WM_TIMER {
                     // The hold threshold can pass with no keystroke at all, and the hook
                     // only fires on input - this timer is what makes a bare hold work.
-                    STATE.with(|s| {
-                        if let Some(st) = s.borrow_mut().as_mut() {
-                            tick(st);
-                        }
+                    let summoned = STATE.with(|s| {
+                        s.borrow_mut()
+                            .as_mut()
+                            .map(tick)
+                            .unwrap_or(false)
                     });
+                    if summoned {
+                        // Runs here rather than in the callback: a timer message is an ordinary
+                        // part of this loop, with no LowLevelHooksTimeout behind it.
+                        wake.wake();
+                    }
                     continue;
                 }
                 // SAFETY: msg came from GetMessageW.
@@ -606,15 +730,34 @@ pub fn spawn_hook(cfg: HookConfig) -> std::sync::mpsc::Receiver<HookEvent> {
                 }
             }
 
-            // SAFETY: hook is the handle returned by SetWindowsHookExW on this thread.
+            // SAFETY: hook and watch are the handles returned by the two installs above.
             unsafe {
                 let _ = KillTimer(None, TIMER_ID);
                 let _ = UnhookWindowsHookEx(hook);
+                if !watch.0.is_null() {
+                    let _ = UnhookWinEvent(watch);
+                }
             }
             STATE.with(|s| *s.borrow_mut() = None);
         })
         .expect("spawn hook thread");
     rx
+}
+
+/// Foreground-change callback. Says one thing, cheaply, and hands the work to the loop: the
+/// UI is the only place that can decide what a foreground change *means* for an open sheet.
+unsafe extern "system" fn foreground_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if event == EVENT_SYSTEM_FOREGROUND {
+        wake_our_message_loop();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +779,10 @@ const TRAY_UID: u32 = 1;
 
 thread_local! {
     static TRAY_SINK: RefCell<Option<Sender<TrayEvent>>> = const { RefCell::new(None) };
+    /// And the way to tell the UI thread that the sink has something in it. Without this the
+    /// open panel would have to keep repainting to notice a tray click - the one menu item
+    /// there is, and the only exit a windowless resident app has (BUG-007).
+    static TRAY_WAKE: RefCell<Option<UiWake>> = const { RefCell::new(None) };
 }
 
 /// UTF-16 with the terminator, for the handful of strings the shell APIs want.
@@ -665,6 +812,14 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 TRAY_SINK.with(|s| {
                     if let Some(tx) = s.borrow().as_ref() {
                         let _ = tx.send(TrayEvent::Quit);
+                    }
+                });
+                // Woken directly rather than through the queue, which this callback is allowed
+                // to do: a tray window proc has no timeout budget behind it, and the worst the
+                // egui lock can cost here is one frame's worth of waiting.
+                TRAY_WAKE.with(|w| {
+                    if let Some(wake) = w.borrow().as_ref() {
+                        wake.wake();
                     }
                 });
             }
@@ -700,12 +855,13 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 /// Install the tray icon on its own thread with its own message loop, and return the
 /// stream of choices. The icon is the app's only presence in the shell: the overlay window
 /// is a tool window and never shows in the taskbar.
-pub fn spawn_tray() -> std::sync::mpsc::Receiver<TrayEvent> {
+pub fn spawn_tray(wake: UiWake) -> std::sync::mpsc::Receiver<TrayEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("ss-tray".into())
         .spawn(move || {
             TRAY_SINK.with(|s| *s.borrow_mut() = Some(tx));
+            TRAY_WAKE.with(|s| *s.borrow_mut() = Some(wake));
 
             // SAFETY: every call below works on handles created here or on static resources,
             // and the thread owns the window and the icon for its whole life.
@@ -1040,5 +1196,50 @@ mod tests {
         let combo = Combo::parse("Shift+Ctrl+Z").unwrap();
         let vks: Vec<u16> = combo.0.iter().map(|k| k.vk()).collect();
         assert_eq!(vks, vec![0x11, 0x10, 0x5A], "modifiers first, canonical order");
+    }
+
+    /// The wake is the replacement for the open panel's repaint loop, so its two edges are
+    /// worth pinning: it must be harmless before the UI exists, and it must not be replaceable.
+    #[test]
+    fn the_wake_fires_only_once_the_ui_has_attached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let wake = UiWake::default();
+        // The hook thread can decide to show a sheet before the first frame has ever run.
+        // Dropping that wake is correct - the UI is painting frames at that point anyway -
+        // but panicking on it would take the desktop's keyboard hook with it.
+        wake.wake();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        wake.attach(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        wake.wake();
+        wake.wake();
+
+        // A second attach must not replace the first: the UI calls this on the frame after
+        // the frame that bound it, and a replaced closure would be a leaked context at best.
+        wake.attach(|| unreachable!("the first attach is the only one that counts"));
+        wake.wake();
+
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "one wake before attach, three after");
+    }
+
+    #[test]
+    fn a_wake_clone_reaches_the_same_slot_as_its_original() {
+        // Both worker threads are handed clones of one wake. If cloning copied the slot, the
+        // UI would bind one thread and never hear from the other.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let wake = UiWake::default();
+        let twin = wake.clone();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        wake.attach(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        twin.wake();
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the clone woke the attached closure");
     }
 }

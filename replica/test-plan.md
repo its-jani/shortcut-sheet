@@ -1,6 +1,6 @@
 # Test plan: shortcut-sheet
 
-Build: 0.1.0 release, `x86_64-pc-windows-msvc`, 96 unit tests  Date: 2026-11-02
+Build: 0.1.0 release, `x86_64-pc-windows-msvc`, 108 unit tests  Date: 2026-11-08
 Env: Windows 11 26H2 desktop, single monitor at 200 % scaling, seed data = the built-in
 `src/data/apps.json` (26 profiles over 38 exe names / 511 shortcuts / 64 roster names of which 60
 carry an exe / 4 rows carrying 5 aliases) plus whatever is in `%LOCALAPPDATA%\shortcut-sheet`
@@ -102,6 +102,7 @@ and it installs no hook and no tray so a test run cannot interfere with the mach
 | -E8 | a new session inherits nothing | edge: Alt-Tab and summon again | Chrome with a filter and row 6 selected → close → open VS Code | the second sheet is the editor's list, unfiltered, selection at row 1, focus not held | unit: `closing_forgets_the_app_the_search_and_the_selection` | **unit** |
 | -E9 | clicking away ends the session | edge: the user leaves while the box holds focus | click in, then click another window | the panel stops floating over somebody else's work | code path `left_the_session`; the 500 ms grace is not measured, and this behaviour is ours and not observed in the target | **manual** |
 | -E10 | the search reads a row's other names | happy | over Chrome's 30 rows type `inspect element` - no row is called that | the one row labelled `Developer tools` is what is left, because its alias list contains the phrase | probe: `search-filtered.png`; unit: `typing_the_other_name_of_a_command_finds_the_row`, `an_alias_match_and_the_label_match_reach_the_same_row`, `a_row_can_be_found_by_a_name_it_does_not_display`, `every_alias_of_a_row_is_searchable_not_just_the_first`, `a_match_on_the_visible_name_outranks_the_same_match_on_an_alias`, `alias_discount_never_flips_a_match_into_a_non_match` | **pass** |
+| -E11 | an open panel costs nothing to look at | perf: idle repaint | `pwsh replica/tmp/repaint.ps1 -Warm 6 -Window 10` - `--peek`, then process CPU-seconds sampled while the panel is verified on screen at both ends | no frames while nothing changes: the panel is static text, so idle should read ~0 CPU | probe: **0.03 CPU-seconds per 10 s** against **10.08** before the fix (1.008 s per idle second - a full core); the probe also prints whether the panel survived the window and where the pointer was, because both change the answer · unit: `an_idle_open_panel_asks_for_no_frames` and eleven more on `Sheet::next_timer` | **pass** (BUG-007) |
 
 ## Probe caveat: `focus restored` is a handle comparison
 
@@ -120,17 +121,16 @@ red `False` here does not go hunting for a bug that is not there.
 
 ## Known open items
 
-Six reports stay open after this pass. None of them is in the core loop; all of them are measured
-rather than assumed.
+Five reports stay open after this pass. None of them is in the core loop; all of them are measured
+rather than assumed. **BUG-007 is no longer one of them:** the open panel went from 10.08 CPU-seconds
+per 10 s - one core held for as long as the sheet was up - to 0.03, by replacing the repaint loop
+with wakes from the hook, the tray and a foreground-change watch plus two exact timers. The hidden
+path's 8 Hz poll was left alone and still costs 0.19 CPU-seconds per 8 s; case -E11 is the new check.
 
 - **BUG-006** - idle footprint 103.1 MB working set / 64.1 MB private against the relaxed 60 MB
   budget, re-measured on this build and unchanged since the report was written. The 15 MB figure in
   the original brief belongs to a native-drawn overlay, not to a GL-composited egui window; that
   trade was made on purpose when the renderer was chosen.
-- **BUG-007** - the overlay repaints at ~55 fps while it is open, because the visible branch of
-  `ui()` ends in an unconditional `ctx.request_repaint()`. Costs battery and fan noise for a lookup
-  that lasts two seconds. The fix touches the same repaint discipline that BUG-003 proved
-  load-bearing, so it wants its own test cycle.
 - **BUG-009** - the held-key path, in both modes, cannot be tested from a script because the hook
   rejects injected input by design. Sixteen unit tests drive the state machine against a synthetic
   key stream and `--peek` drives everything except the press itself, but **the latency budget
@@ -149,13 +149,15 @@ rather than assumed.
 ## How to re-run
 
 ```
-cargo test                                    # 96 cases, under a second
+cargo test                                    # 108 cases, under a second
 python .qoder/skills/replica-diff/parity.py replica/features.csv --markdown
 python replica/tmp/csvcheck.py                # the matrix's column count, before parity.py eats it
 pwsh replica/tmp/peek.ps1                     # S01 state: styles, focus, screenshot, memory, quit
 pwsh replica/tmp/detect.ps1                   # live foreground -> profile resolution, both shelves
 pwsh replica/tmp/fire.ps1                     # click a row, read the fired line back
 pwsh replica/tmp/mem.ps1                      # idle footprint, normally launched, 12 s in
+pwsh replica/tmp/repaint.ps1 -Warm 6 -Window 10  # CPU-seconds with the panel open and idle
+pwsh replica/tmp/resident.ps1                 # normal launch: both installs, hidden idle cost
 pwsh replica/tmp/search.ps1                   # the focused box: enter | arrow | escape, or both
 pwsh replica/tmp/roster.ps1                   # the empty panel for a roster name
 pwsh replica/tmp/theme.ps1                    # light and dark, measured from the captured pixels

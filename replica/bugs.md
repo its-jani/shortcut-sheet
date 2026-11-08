@@ -3,8 +3,8 @@
 Build under test: 0.1.0 release, `x86_64-pc-windows-msvc`, egui 0.37 / eframe 0.37 / winit 0.30.13.
 Env: Windows 11 26H2, single monitor at 200 %. Case IDs refer to `replica/test-plan.md`.
 
-Sixteen reports. Ten are found-and-fixed, six are open: two real defects in the product
-(BUG-006 memory, BUG-007 repaint rate), three dead settings (BUG-010), one cosmetic issue waiting
+Sixteen reports. Eleven are found-and-fixed, five are open: one real defect in the product
+(BUG-006 memory), three dead settings (BUG-010), one cosmetic issue waiting
 on a design decision (BUG-013), one deliberate filter that makes the core loop untestable from a
 script (BUG-009), and one probe that measures the wrong thing (BUG-016). BUG-008 is not an app bug
 at all - it is a probe that lied - and it is written up anyway, because it sent an investigation
@@ -119,12 +119,17 @@ Evidence: `replica/tmp/mem.ps1` (normal launch, nothing painted, read after 12 s
 Suspected cause: a GPU-composited egui viewport. The 15 MB figure belongs to a native XAML or Win32-drawn overlay, not to a GL surface with a tessellation cache; that trade was made explicitly when the renderer was chosen.
 Status: open. Options, cheapest first: cap the repaint rate (BUG-007) and re-measure, drop `tracing-appender`'s non-blocking worker thread, or replace eframe's glow context with the software backend (`egui-wgpu`/`software` painting is not smaller, but `egui` without a GL context can be). Getting under 15 MB means not using egui, which is a different decision than a bug.
 
+Amendment: the cheapest option has now been taken - BUG-007 is resolved - and the memory did not
+move. With the panel painted the process reads 114.5 MB working set / 70.0 MB private, against the
+118.4 MB / 70.5 MB this report first quoted, and the idle figure is unchanged at 103 MB / 64 MB. The
+repaint loop was CPU and battery, not working set; the floor belongs to the GL surface.
+
 ### BUG-007: the overlay repaints at ~55 fps while it is open
 
 - Severity: S3 - battery and fan noise for a lookup that lasts two seconds
-- Flow / case: F01-P2, -E2
+- Flow / case: F01-P2, -E2, -E11
 - Screen: S01
-- Build: 0.1.0 with temporary instrumentation, since removed
+- Build: 0.1.0 with temporary instrumentation, since removed; fixed on 0.4.0
 
 Steps
 1. `RUST_LOG=debug`, open S01, count paint passes per second.
@@ -133,7 +138,52 @@ Expected: frames on demand - the panel is static text with no animation, and `ma
 Actual: 269 list passes in a ~10 s run, timestamps 18 ms apart, because the visible branch of `ui()` ends in an unconditional `ctx.request_repaint()`. The hidden path is correct: `request_repaint_after(120 ms)`, 8 Hz.
 Evidence: the instrumented log lines from `Sheet::ui`'s visible branch; the DIAG was removed once it had answered BUG-008.
 Suspected cause: `request_repaint()` was written to guarantee the peek deadline and the caret blink keep running; it also guarantees a frame when nothing has changed.
-Status: open. The fix is `request_repaint_after` with a small delay, plus an immediate repaint only on the paths that change something (hover, query, action, deadline). Not done in this pass because it touches the same repaint discipline that BUG-003 proved load-bearing, and it deserves its own test cycle.
+
+Status: **resolved.** The free-running call is gone, not slowed down. What the loop was buying,
+and what buys it now:
+
+| the loop's job | what replaced it |
+| --- | --- |
+| notice the trigger key came up (hide the sheet) | the hook thread wakes the UI through `UiWake` whenever its decision is not `Request::None` |
+| notice a second chord press, or a summon over another window | the same wake |
+| notice the tray's Quit | the tray thread wakes the UI after sending the event |
+| notice the foreground moved elsewhere | a `WINEVENT_OUTOFCONTEXT` watch on `EVENT_SYSTEM_FOREGROUND`, installed on the hook thread |
+| the caret blink | egui already schedules those frames itself (`paint_text_cursor` calls `request_repaint_after_secs`), ~2 fps and only while the box holds focus |
+| hover, typing, clicks, key presses | OS input events. eframe runs `ControlFlow::Wait`, so no event means no frame - which is the same thing as 0 fps, not a poll with a longer period |
+| the `--peek` deadline and the focus grace | `Sheet::next_timer`, one exact `request_repaint_after`, and `None` - no frame at all - when neither clock is running |
+
+Measured idle with the panel open, before and after (`replica/tmp/repaint.ps1`: `--peek`, process
+CPU-seconds sampled while the panel is verified on screen at both ends of the window and the pointer
+is nowhere near it):
+
+- **before: 10.08 CPU-seconds in 10 s** - 1.008 s of CPU per idle second, one core saturated for as
+  long as the sheet was up. The report's "~55 fps" understated it: that is a full core, not a busy
+  one.
+- **after: 0.03 CPU-seconds in 10 s** - 0.003 s per idle second. Two earlier windows read 0.00.
+- ~340x less. At the pre-fix cost of ~18 ms of CPU per frame, 0.03 s is one or two frames across the
+  whole window instead of 550, so **idle repaint is effectively 0 fps** rather than 55.
+- Two other runs of the same probe read 1.1-1.3 CPU-seconds, and the probe now says why on its own
+  output: the panel closed mid-window because the desktop was being used, so the window was not an
+  idle read. That context line exists because of BUG-008 - a CPU number without it is exactly the
+  kind of evidence that has been wrong here before.
+
+Verified rather than assumed after the change: `focus not stolen: True` with `exstyle=0x08000198`
+while the panel sat idle (`peek.ps1`) - BUG-001's per-frame ex-style re-assertion still follows every
+winit window-state change, because both are driven by the same event, and the show and dismiss paths
+still request their own follow-up frame; `quit on deadline: True` (BUG-003, the early-`return`
+must-own-a-repaint rule this fix had to respect); `global keyboard hook installed` and
+`foreground-change watch installed` on a normal launch (`resident.ps1`); 108 unit tests, 12 of them
+new, of which `an_idle_open_panel_asks_for_no_frames` is the one that fails if the loop comes back.
+
+What did not change, and why: the hidden path still polls at 120 ms (0.19 CPU-seconds per 8 s
+measured, unchanged). The keyboard callback cannot wake the UI itself - `egui::Context` is
+lock-backed, and a low-level hook that outruns `LowLevelHooksTimeout` is silently uninstalled by
+Windows - so the callback posts a message to its own thread's queue and the loop does the wake. That
+loop only exists while a trigger mode is on, which is also the only time a hidden panel needs
+noticing. Making the hidden path event-driven as well is now a small step rather than a redesign.
+
+Still a human check, as BUG-009 says: the physical hold and the physical chord, including the wake
+that ends each of them. No script can press a key the hook will believe.
 
 ### BUG-008: the probes lied about the panel (not an app bug)
 

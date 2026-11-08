@@ -88,6 +88,10 @@ fn main() -> eframe::Result<()> {
     // ignores injected input. Peek mode installs no hook and no tray, so a verification run
     // cannot interfere with the machine it is checking.
     let peek = peek_app(&catalog, std::env::args().skip(1));
+    // The two worker threads start before the egui context does, and they are the only way a
+    // decision made outside the UI thread reaches it. The open panel used to poll for them by
+    // repainting 55 times a second; now they say when (BUG-007).
+    let wake = platform::UiWake::default();
     let (events, tray) = match peek {
         Some(_) => (None, None),
         None => {
@@ -96,9 +100,12 @@ fn main() -> eframe::Result<()> {
                 // that watches for nothing is a keystroke callback paid for every key typed.
                 // The tray stays, because without it the only way out is Task Manager.
                 tracing::warn!("both trigger modes are off; the overlay can only be summoned with --peek");
-                (None, Some(platform::spawn_tray()))
+                (None, Some(platform::spawn_tray(wake.clone())))
             } else {
-                (Some(platform::spawn_hook(hook)), Some(platform::spawn_tray()))
+                (
+                    Some(platform::spawn_hook(hook, wake.clone())),
+                    Some(platform::spawn_tray(wake.clone())),
+                )
             }
         }
     };
@@ -117,15 +124,17 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
-        // The overlay drives its own repaint: idle at 8 Hz while hidden, on-demand while
-        // shown. Nothing here should ask the backend for a continuous animation loop.
+        // The overlay drives its own repaint, and nothing here should ask the backend for a
+        // continuous animation loop: idle while hidden is a slow poll for the trigger, and an
+        // open panel takes frames from events (input, the hook, the tray, a foreground change)
+        // plus two exact timers - the peek deadline and the focus grace. See Sheet::ui.
         ..Default::default()
     };
 
     eframe::run_native(
         "shortcut-sheet",
         options,
-        Box::new(move |_cc| Ok(Box::new(Sheet::new(catalog, events, tray, peek)))),
+        Box::new(move |_cc| Ok(Box::new(Sheet::new(catalog, events, tray, peek, wake)))),
     )
 }
 

@@ -46,6 +46,11 @@ pub struct Sheet {
     palette: Palette,
     dark: bool,
     last_fire: Option<Instant>,
+    /// How the hook and tray threads ask for a frame. Holding it is what lets the open panel
+    /// stop painting to find out whether something happened (BUG-007).
+    wake: platform::UiWake,
+    /// The context only exists from the first frame on, and only the first hand-over matters.
+    wake_bound: bool,
     stats: Stats,
 }
 
@@ -66,6 +71,7 @@ impl Sheet {
         events: Option<std::sync::mpsc::Receiver<HookEvent>>,
         tray: Option<std::sync::mpsc::Receiver<TrayEvent>>,
         peek: Option<String>,
+        wake: platform::UiWake,
     ) -> Self {
         let dark = false;
         Self {
@@ -86,6 +92,8 @@ impl Sheet {
             palette: if dark { uitok::DARK } else { uitok::LIGHT },
             dark,
             last_fire: None,
+            wake,
+            wake_bound: false,
             stats: Stats::default(),
         }
     }
@@ -359,7 +367,7 @@ impl Sheet {
             let (Some(hwnd), Some(since)) = (self.hwnd, self.focused_since) else {
                 return false;
             };
-            front.0 != hwnd && since.elapsed() > Duration::from_millis(500)
+            front.0 != hwnd && since.elapsed() > GRACE
         } else {
             // Browse mode. The app the session came from is the expected foreground, and our
             // own window showing up there is winit's doing rather than the user's - that is
@@ -419,11 +427,71 @@ impl Sheet {
             }
         })
     }
+
+    /// The frames the open panel still has to ask for itself, because nothing else will.
+    ///
+    /// Everything the old 55 fps loop was covering has an event now: pointer and key input
+    /// arrive as OS events, which eframe turns into a frame on its own; the caret blink
+    /// schedules its own frames inside egui; the hook and the tray wake this thread through
+    /// `UiWake`; and a foreground change arrives as a WinEvent. What is left is the two
+    /// clocks the app owns, and both are exact timers rather than a poll - so an idle panel
+    /// paints zero times a second.
+    fn schedule_next_frame(&self, ctx: &egui::Context) {
+        if let Some(wait) = self.next_timer(Instant::now()) {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
+    /// The pure half, with the clock handed in: the shortest wait still outstanding, or
+    /// `None` when nothing is running and the loop should sleep until something happens.
+    /// `None` is the whole point of this function - it is the assertion that an open,
+    /// idle, unheld panel asks for no frames at all.
+    fn next_timer(&self, now: Instant) -> Option<Duration> {
+        let mut wait: Option<Duration> = None;
+        if let Some(deadline) = self.peek_until {
+            // `--peek` closes itself, and a verification run must not linger on screen. A
+            // deadline already gone asks for a zero wait: the next frame is the one that
+            // notices and quits, and nothing may sleep past it.
+            sooner(&mut wait, deadline.saturating_duration_since(now));
+        }
+        if self.overlay.focused {
+            // The activation we asked for lands a frame or two late, so a foreground we do not
+            // own is only a departure once the grace has run out. If it has not, this frame's
+            // answer is not final - and with no free-running loop, the frame that looks again
+            // has to be the one that schedules it.
+            if let Some(since) = self.focused_since {
+                let left = GRACE.saturating_sub(now.saturating_duration_since(since));
+                if left > Duration::ZERO {
+                    sooner(&mut wait, left);
+                }
+            }
+        }
+        wait
+    }
+}
+
+/// How long a deliberate focus change is given to land before a foreign foreground counts
+/// as the user having moved on.
+const GRACE: Duration = Duration::from_millis(500);
+
+/// Keep the sooner of two waits.
+fn sooner(best: &mut Option<Duration>, candidate: Duration) {
+    if best.is_none_or(|b| candidate < b) {
+        *best = Some(candidate);
+    }
 }
 
 impl eframe::App for Sheet {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // The hook and tray threads were spawned before this context existed. Handing it over
+        // once is how they learn about it, and it is what lets the open panel stop polling
+        // them (BUG-007).
+        if !self.wake_bound {
+            self.wake_bound = true;
+            let painter = ctx.clone();
+            self.wake.attach(move || painter.request_repaint());
+        }
         if self.closing {
             // Leaving. If the handle is not known yet this keeps trying, slowly, because a
             // resident app with no window and no quit is an app the user has to kill in
@@ -531,11 +599,138 @@ impl eframe::App for Sheet {
         // Ctrl-up from the hook can still arrive while we are focused.
         self.drain_events(&ctx);
         self.drain_tray(&ctx);
-        ctx.request_repaint();
+        // And that is the whole frame. The loop used to end in an unconditional
+        // `ctx.request_repaint()`, which bought the two things this now gets from events -
+        // the hook's key release and the tray's quit - at 55 frames a second for as long as
+        // the sheet sat open (BUG-007).
+        self.schedule_next_frame(&ctx);
     }
 }
 
 /// Best-effort read of the OS app-mode. `AppsUseLightTheme` under Themes\Personalize.
 fn detect_system_dark() -> bool {
     platform::apps_use_light_theme().map(|light| !light).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Sheet` with no channels and no window, which is everything the frame schedule
+    /// looks at. The tag keeps parallel tests off each other's temporary data directory.
+    fn sheet(tag: &str) -> Sheet {
+        let dir = std::env::temp_dir().join(format!("ss-app-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Sheet::new(
+            Catalog::load(&dir).expect("builtin catalog"),
+            None,
+            None,
+            None,
+            platform::UiWake::default(),
+        )
+    }
+
+    /// The whole point of BUG-007: a sheet that is open, idle and not being held must ask
+    /// for nothing. Before the fix this returned "repaint now" for as long as the panel was up.
+    #[test]
+    fn an_idle_open_panel_asks_for_no_frames() {
+        let now = Instant::now();
+        let s = sheet("idle");
+        assert_eq!(s.next_timer(now), None, "nothing is running, so nothing may be scheduled");
+    }
+
+    #[test]
+    fn a_browse_session_under_a_hold_has_no_clock_either() {
+        // The hold itself is watched by the hook, not by the UI loop, so even a session that
+        // was summoned by a key needs no frames from here.
+        let now = Instant::now();
+        let mut s = sheet("hold");
+        s.summoned = Some(Summon::Hold);
+        s.target = Some(TargetWindow(1));
+        assert_eq!(s.next_timer(now), None);
+    }
+
+    #[test]
+    fn the_peek_deadline_is_an_exact_timer_not_a_poll() {
+        let now = Instant::now();
+        let mut s = sheet("deadline");
+        s.peek_until = Some(now + Duration::from_secs(25));
+        let wait = s.next_timer(now).expect("a deadline is a reason to come back");
+        assert!(
+            wait > Duration::from_secs(24) && wait <= Duration::from_secs(25),
+            "the wait should be the deadline itself, got {wait:?}"
+        );
+    }
+
+    #[test]
+    fn a_deadline_that_has_passed_asks_for_a_frame_immediately() {
+        // Sleeping past a passed deadline is how a --peek run sat on screen forever: the
+        // frame that notices it has to be the next one (BUG-003).
+        let now = Instant::now();
+        let mut s = sheet("passed");
+        s.peek_until = Some(now - Duration::from_millis(10));
+        assert_eq!(s.next_timer(now), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn the_focus_grace_comes_back_and_looks_again() {
+        let now = Instant::now();
+        let mut s = sheet("grace");
+        s.overlay.focused = true;
+        s.focused_since = Some(now);
+        let wait = s.next_timer(now).expect("the activation has not landed yet");
+        assert!(wait > GRACE / 2 && wait <= GRACE, "roughly the rest of the grace, got {wait:?}");
+    }
+
+    #[test]
+    fn the_grace_stops_scheduling_once_it_has_run_out() {
+        // Past the grace the answer is final: either the foreground moved on and the next
+        // event-driven frame dismisses, or it did not and there is nothing to watch for.
+        let now = Instant::now();
+        let mut s = sheet("grace-out");
+        s.overlay.focused = true;
+        s.focused_since = Some(now - GRACE);
+        assert_eq!(s.next_timer(now), None);
+    }
+
+    #[test]
+    fn no_grace_frame_is_scheduled_for_a_session_that_never_took_focus() {
+        // The browse path must not start poking at focus it never had: that is the promise.
+        let now = Instant::now();
+        let mut s = sheet("never-focused");
+        s.focused_since = Some(now);
+        assert!(!s.overlay.focused, "a stale timestamp is not the same as holding the caret");
+        assert_eq!(s.next_timer(now), None);
+    }
+
+    #[test]
+    fn the_soonest_clock_wins_when_both_are_running() {
+        let now = Instant::now();
+        let mut s = sheet("both");
+        s.peek_until = Some(now + Duration::from_secs(9));
+        s.overlay.focused = true;
+        s.focused_since = Some(now);
+        let wait = s.next_timer(now).expect("two clocks");
+        assert!(wait <= GRACE, "the grace is the shorter wait, got {wait:?}");
+    }
+
+    #[test]
+    fn sooner_takes_the_first_and_then_only_the_smaller() {
+        let mut best: Option<Duration> = None;
+        sooner(&mut best, Duration::from_millis(300));
+        assert_eq!(best, Some(Duration::from_millis(300)));
+        sooner(&mut best, Duration::from_millis(900));
+        assert_eq!(best, Some(Duration::from_millis(300)), "a longer wait is not a reason");
+        sooner(&mut best, Duration::from_millis(120));
+        assert_eq!(best, Some(Duration::from_millis(120)));
+    }
+
+    #[test]
+    fn a_zero_wait_survives_a_longer_one() {
+        // A passed deadline must not be pushed out by an unrelated longer timer, or the
+        // quit is late by that timer.
+        let mut best: Option<Duration> = Some(Duration::ZERO);
+        sooner(&mut best, Duration::from_secs(4));
+        assert_eq!(best, Some(Duration::ZERO));
+    }
 }
