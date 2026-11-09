@@ -37,13 +37,17 @@ fn main() -> eframe::Result<()> {
 
     let settings = catalog.settings.clone();
     // The two trigger modes the target's own `KeyboardShortcut` setting carries, turned into
-    // what the hook watches for: a key plus a delay, and a chord that needs neither.
+    // what the hook watches for: a key set plus a delay, and a chord that needs neither. Both
+    // are any keys the settings file can name, resolved once here so the tray tooltip below
+    // cannot say something the hook is not doing. An empty list is how each mode says it is
+    // off, which covers a user who turned it off and a user who typo'd it with one answer.
+    let triggers = settings.triggers();
     let hook = platform::HookConfig {
-        trigger_vk: settings.trigger.vk(),
+        trigger: triggers.hold_keys(),
         hold: settings.hold(),
-        long_press: settings.long_press_enabled,
-        chord: settings.instant_chord(),
+        chord: triggers.chord_keys(),
     };
+    let hint = triggers.hint();
     // One line per run in the log, so "it stopped working" has a starting point: version,
     // where the data was read from, and what the hook was told to watch for.
     tracing::info!(
@@ -56,9 +60,10 @@ fn main() -> eframe::Result<()> {
             .iter()
             .map(|a| a.all_shortcuts().filter(|s| !s.removed).count())
             .sum::<usize>(),
-        trigger = ?settings.trigger,
+        trigger = %settings.trigger,
+        hold_keys = ?hook.trigger,
         hold_ms = settings.hold_ms,
-        long_press = hook.long_press,
+        long_press = !hook.trigger.is_empty(),
         instant = !hook.chord.is_empty(),
         instant_hotkey = %settings.instant_hotkey,
         "shortcut-sheet starting"
@@ -95,16 +100,16 @@ fn main() -> eframe::Result<()> {
     let (events, tray) = match peek {
         Some(_) => (None, None),
         None => {
-            if !hook.long_press && hook.chord.is_empty() {
+            if hook.trigger.is_empty() && hook.chord.is_empty() {
                 // Both modes off is a real configuration, not a broken one, but a global hook
                 // that watches for nothing is a keystroke callback paid for every key typed.
                 // The tray stays, because without it the only way out is Task Manager.
                 tracing::warn!("both trigger modes are off; the overlay can only be summoned with --peek");
-                (None, Some(platform::spawn_tray(wake.clone())))
+                (None, Some(platform::spawn_tray(wake.clone(), hint)))
             } else {
                 (
                     Some(platform::spawn_hook(hook, wake.clone())),
-                    Some(platform::spawn_tray(wake.clone())),
+                    Some(platform::spawn_tray(wake.clone(), hint)),
                 )
             }
         }

@@ -627,9 +627,13 @@ mod tests {
 
     #[test]
     fn key_labels_come_from_the_key_model() {
-        use crate::data::Key;
+        use crate::data::key::Key;
         assert_eq!(Key::Ctrl.label(), "Ctrl");
         assert_eq!(Key::Grave.label(), "`");
+        // The keys a custom trigger usually gets pointed at, whose labels have to stay narrow
+        // enough to fit a chip.
+        assert_eq!(Key::CapsLock.label(), "Caps");
+        assert_eq!(Key::Apps.label(), "Menu");
     }
 
     /// The hover row is a *tint*: a low-alpha wash over whatever is behind it, per tokens.json

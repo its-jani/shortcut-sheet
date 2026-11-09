@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use key::{Combo, Key};
+/// The chord model is part of this module's vocabulary - a shortcut, a trigger key and a
+/// summon chord are all one `Combo` - while `Key` is reached through [`key`] by the two places
+/// that name a single key: the renderer and the hook.
+pub use key::Combo;
 
 /// One command and the chord that fires it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,33 +143,17 @@ pub enum Theme {
     Dark,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Trigger {
-    Ctrl,
-    Alt,
-    Shift,
-    Win,
-}
-
-impl Trigger {
-    pub fn vk(self) -> u32 {
-        match self {
-            // Left-hand codes: the common case, and the hook also sees the right-hand
-            // variant because we match on the generic VK the OS reports.
-            Trigger::Ctrl => Key::Ctrl.vk() as u32,
-            Trigger::Alt => Key::Alt.vk() as u32,
-            Trigger::Shift => Key::Shift.vk() as u32,
-            Trigger::Win => Key::Win.vk() as u32,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// The key a *hold* is measured on - the target's `LongPressKey`.
-    pub trigger: Trigger,
+    /// The key - or key set - a *hold* is measured on: the target's `LongPressKey`, freed from
+    /// the four modifiers that setting offered. Anything [`Combo::parse_trigger`] reads works,
+    /// so `"ctrl"`, `"f13"`, `"capslock"`, `"grave"` and `"ctrl+shift"` are all valid, spelled
+    /// the same way as every other chord in this project and case-insensitively.
+    ///
+    /// The keys are watched, never swallowed, so the best trigger is a key that does nothing on
+    /// its own: a modifier, a high function key, or one of the spare keys.
+    pub trigger: String,
     /// How long the trigger must be held before the overlay appears (`LongPressDelay`).
     pub hold_ms: u64,
     /// Long-press mode on or off (`LongPressShortcutEnabled`).
@@ -177,7 +164,8 @@ pub struct Settings {
     /// The instant chord, written the way every other chord in this project is written
     /// (`StaticShortcutKeys`, which the observed configuration spells `[91, 18]` = Win+Alt).
     /// Parsed by [`Combo::parse_hotkey`], which like this field is about pressing keys
-    /// together rather than firing one into an app.
+    /// together rather than firing one into an app. Any key or keys will do; two of them is
+    /// the minimum, because a one-key instant trigger is a stolen keystroke.
     pub instant_hotkey: String,
     /// 0.0 - 0.25: how much to fade the overlay background.
     pub fade: f32,
@@ -189,7 +177,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            trigger: Trigger::Ctrl,
+            trigger: "ctrl".into(),
             // 1.5 s, not 1 s: the target's own settings log writes a first hold of
             // `00:00:01.5` before any of the user's changes, and a shorter threshold fires
             // the overlay every time someone uses Ctrl+C.
@@ -214,23 +202,96 @@ impl Settings {
         std::time::Duration::from_millis(self.hold_ms)
     }
 
-    /// Virtual-key codes for the instant chord, or an empty list when the mode is off.
+    /// The key set a hold is measured on, as written. `None` when the mode is off or the
+    /// spelling is not a key this build knows.
     ///
-    /// An unparseable `instant_hotkey` disables the instant mode instead of disabling the
-    /// app, and says so in the log: this file is hand-edited, and one typo in a settings
-    /// string must not put a resident utility's whole trigger path out of action.
-    pub fn instant_chord(&self) -> Vec<u32> {
+    /// The same bargain [`Triggers::chord_keys`] strikes: this file is hand-edited, and the
+    /// answer to a typo is that one setting going off with a line in the log - never the app,
+    /// and never a silent substitution of some key the user did not ask for.
+    fn hold_keys(&self) -> Option<Combo> {
+        if !self.long_press_enabled {
+            return None;
+        }
+        match Combo::parse_trigger(&self.trigger) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::error!(trigger = %self.trigger, error = %e,
+                    "trigger does not parse; the long-press trigger is off");
+                None
+            }
+        }
+    }
+
+    /// Both trigger modes, read once, in the shape the hook and the tray icon want them: a
+    /// list of codes per mode, where an empty list means watch for nothing. An empty hold is
+    /// what a turned-off mode and an unreadable key both come to, and an empty chord likewise
+    /// means no chord is watched - a resident utility must not install a keystroke callback
+    /// for a trigger the user did not successfully ask for.
+    pub fn triggers(&self) -> Triggers {
+        Triggers { hold: self.hold_keys(), chord: self.instant_keys() }
+    }
+
+    /// The summon chord as written, or `None` when the mode is off or the spelling fails. Off
+    /// means off without a word in the log, because a string the user has told this build to
+    /// ignore is not a typo worth reporting.
+    fn instant_keys(&self) -> Option<Combo> {
         if !self.instant_enabled {
-            return Vec::new();
+            return None;
         }
         match Combo::parse_hotkey(&self.instant_hotkey) {
-            Ok(c) => c.0.iter().map(|k| u32::from(k.vk())).collect(),
+            Ok(c) => Some(c),
             Err(e) => {
                 tracing::error!(hotkey = %self.instant_hotkey, error = %e,
                     "instant_hotkey does not parse; the instant trigger is off");
-                Vec::new()
+                None
             }
         }
+    }
+}
+
+/// The two trigger modes, resolved from the settings into keys.
+#[derive(Debug, Clone, Default)]
+pub struct Triggers {
+    /// The key set a hold is measured on; `None` when that mode is off or unreadable.
+    pub hold: Option<Combo>,
+    /// The instant summon chord; `None` when that mode is off or unreadable.
+    pub chord: Option<Combo>,
+}
+
+impl Triggers {
+    /// The hold keys as the hook wants them, canonical order. Empty is "watch for no hold".
+    pub fn hold_keys(&self) -> Vec<u32> {
+        codes(&self.hold)
+    }
+
+    /// The chord keys as the hook wants them. Empty is "watch for no chord", which is also the
+    /// answer to an unparseable `instant_hotkey`: a typo in one setting of a hand-edited file
+    /// disables that setting and says so in the log rather than putting the whole trigger path
+    /// out of action.
+    pub fn chord_keys(&self) -> Vec<u32> {
+        codes(&self.chord)
+    }
+
+    /// What the tray icon says, so the one place this product tells a user how to summon the
+    /// sheet names the key it is actually watching. One mode per sentence, because a shell
+    /// tooltip is 63 UTF-16 units long, and the hold is what someone who has never seen the app
+    /// needs; the chord is the fallback for the user who switched the hold off on purpose.
+    pub fn hint(&self) -> String {
+        if let Some(keys) = &self.hold {
+            return format!("shortcut-sheet - hold {keys} to see shortcuts");
+        }
+        if let Some(chord) = &self.chord {
+            return format!("shortcut-sheet - press {chord} to see shortcuts");
+        }
+        "shortcut-sheet - no trigger key is switched on".into()
+    }
+}
+
+/// A watched set in the hook's shape: plain codes, canonical order, nothing when off.
+fn codes(combo: &Option<Combo>) -> Vec<u32> {
+    match combo {
+        Some(c) => c.0.iter().map(|k| u32::from(k.vk())).collect(),
+        None => Vec::new(),
     }
 }
 
@@ -846,7 +907,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let c = Catalog::load(&dir).unwrap();
         assert_eq!(c.settings.hold_ms, 1500);
-        assert_eq!(c.settings.trigger, Trigger::Ctrl);
+        assert_eq!(c.settings.trigger, "ctrl");
+        let hold = c.settings.triggers().hold_keys();
+        assert_eq!(hold, vec![0x11], "the stock hold is measured on Ctrl");
         assert_eq!(c.settings.theme, Theme::System);
         assert!(c.settings.long_press_enabled, "the mode the product is built around");
         assert!(!c.settings.instant_enabled, "a second global chord is opt-in");
@@ -863,13 +926,14 @@ mod tests {
         )
         .unwrap();
         assert!(!s.long_press_enabled);
-        assert_eq!(s.instant_chord(), vec![0x5B, 0x12], "Win then Alt, canonical order");
+        assert_eq!(s.triggers().chord_keys(), vec![0x5B, 0x12], "Win then Alt, canonical order");
 
         // Recorded as the very first write in the target's log: instant mode on with the
         // plain Ctrl code, which is a chord of one and therefore not a chord at all.
         let s: Settings =
             serde_json::from_str(r#"{"instant_enabled":true,"instant_hotkey":"Ctrl"}"#).unwrap();
-        assert!(s.instant_chord().is_empty(), "a bare modifier cannot be an instant trigger");
+        let bare = s.triggers().chord_keys();
+        assert!(bare.is_empty(), "a bare modifier cannot be an instant trigger");
     }
 
     #[test]
@@ -881,7 +945,7 @@ mod tests {
             r#"{"instant_enabled":false,"instant_hotkey":"Win+TotallyBogus"}"#,
         )
         .unwrap();
-        assert!(s.instant_chord().is_empty());
+        assert!(s.triggers().chord_keys().is_empty());
     }
 
     #[test]
@@ -889,10 +953,91 @@ mod tests {
         let s: Settings =
             serde_json::from_str(r#"{"instant_enabled":true,"instant_hotkey":"Win+Banan"}"#)
                 .unwrap();
-        assert!(s.instant_chord().is_empty(), "a typo must not kill the hold trigger");
+        assert!(s.triggers().chord_keys().is_empty(), "a typo must not kill the hold trigger");
         // And the mode the user is actually relying on still works.
-        assert_eq!(s.trigger, Trigger::Ctrl);
+        assert_eq!(s.trigger, "ctrl");
         assert_eq!(s.hold(), std::time::Duration::from_millis(1500));
+    }
+
+    /// The feature the four-variant `LongPressKey` of the original could not offer: the key a
+    /// hold is measured on is now any key the parser knows, spelled one way everywhere.
+    #[test]
+    fn a_hold_can_be_measured_on_any_key_the_parser_knows() {
+        for (spelling, vks) in [
+            ("ctrl", vec![0x11]),
+            ("alt", vec![0x12]),
+            ("Win", vec![0x5B]),
+            ("f13", vec![0x7C]),
+            ("capslock", vec![0x14]),
+            ("grave", vec![0xC0]),
+            ("menu", vec![0x5D]),
+            // A key set is a trigger too, and it arrives in canonical order however it was
+            // written, because the hook compares codes, not spellings.
+            ("shift+ctrl", vec![0x11, 0x10]),
+            ("Ctrl+Shift+P", vec![0x11, 0x10, 0x50]),
+        ] {
+            let s: Settings =
+                serde_json::from_str(&format!(r#"{{"trigger":"{spelling}"}}"#)).unwrap();
+            assert_eq!(s.triggers().hold_keys(), vks, "'{spelling}'");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_trigger_disables_the_hold_instead_of_guessing_one() {
+        // Substituting the built-in Ctrl here would mean the app quietly watched a key the
+        // user had rejected, which is a worse answer than the mode being off with a log line.
+        let s: Settings = serde_json::from_str(r#"{"trigger":"banshee"}"#).unwrap();
+        assert!(s.triggers().hold_keys().is_empty());
+        // Two ordinary keys are a sequence nobody can hold, so that is refused too.
+        let s: Settings = serde_json::from_str(r#"{"trigger":"K+S"}"#).unwrap();
+        assert!(s.triggers().hold_keys().is_empty());
+        // Everything else in the file is still believed.
+        assert_eq!(s.hold_ms, 1500);
+        assert_eq!(s.instant_hotkey, "Win+Alt");
+    }
+
+    #[test]
+    fn an_off_hold_mode_never_reads_the_trigger_key() {
+        // The mirror of `an_off_instant_mode_never_reads_the_chord`: off means off, so a
+        // turned-off mode neither watches a key nor complains about the string beside it.
+        let s: Settings =
+            serde_json::from_str(r#"{"long_press_enabled":false,"trigger":"Banshee"}"#).unwrap();
+        assert!(s.triggers().hold_keys().is_empty());
+    }
+
+    /// The tray tooltip is the one place this app tells a user how to summon it, so it has to
+    /// agree with the settings rather than with the key the first build shipped.
+    #[test]
+    fn the_tray_names_the_key_the_trigger_is_actually_watching() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.triggers().hint(), "shortcut-sheet - hold Ctrl to see shortcuts");
+        let s: Settings = serde_json::from_str(r#"{"trigger":"f13"}"#).unwrap();
+        assert_eq!(s.triggers().hint(), "shortcut-sheet - hold F13 to see shortcuts");
+        let s: Settings = serde_json::from_str(r#"{"trigger":"capslock"}"#).unwrap();
+        assert_eq!(s.triggers().hint(), "shortcut-sheet - hold Caps to see shortcuts");
+        let s: Settings = serde_json::from_str(r#"{"trigger":"shift+ctrl"}"#).unwrap();
+        assert_eq!(s.triggers().hint(), "shortcut-sheet - hold Ctrl+Shift to see shortcuts");
+        // Long-press off falls through to the chord, and both off says so plainly instead of
+        // naming a key that does nothing. Both sentences fit a shell tip, which is 63 units.
+        let s: Settings = serde_json::from_str(
+            r#"{"long_press_enabled":false,"instant_enabled":true,"instant_hotkey":"Win+Alt"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.triggers().hint(), "shortcut-sheet - press Win+Alt to see shortcuts");
+        let s: Settings = serde_json::from_str(r#"{"trigger":"banshee"}"#).unwrap();
+        assert_eq!(s.triggers().hint(), "shortcut-sheet - no trigger key is switched on");
+    }
+
+    /// The reason both modes resolve in one call: the keys the hook watches and the sentence
+    /// the tray icon shows are two readings of one answer, so they cannot drift apart.
+    #[test]
+    fn the_hook_and_the_tooltip_are_one_answer_read_twice() {
+        let s: Settings =
+            serde_json::from_str(r#"{"trigger":"ctrl+shift","instant_enabled":true}"#).unwrap();
+        let t = s.triggers();
+        assert_eq!(t.hold_keys(), vec![0x11, 0x10], "what the hook is told to watch");
+        assert_eq!(t.chord_keys(), vec![0x5B, 0x12]);
+        assert!(t.hint().contains("Ctrl+Shift"), "the tooltip names the same keys: {}", t.hint());
     }
 
     /// Detection needs the roster, or every app the target supports and we have not written
@@ -1038,15 +1183,17 @@ mod tests {
     #[test]
     fn settings_defaults_are_sane() {
         let s = Settings::default();
-        assert_eq!(s.trigger, Trigger::Ctrl);
+        assert_eq!(s.trigger, "ctrl");
         assert!(s.hold_ms > 300 && s.hold_ms < 2000, "hold_ms {} is not usable", s.hold_ms);
     }
 
     #[test]
     fn settings_round_trip_with_missing_fields() {
-        // An older settings file must still load: every field is #[serde(default)].
+        // An older settings file must still load: every field is #[serde(default)]. The four
+        // spellings the first build accepted are ordinary keys now, so they read unchanged.
         let s: Settings = serde_json::from_str(r#"{"trigger":"alt"}"#).unwrap();
-        assert_eq!(s.trigger, Trigger::Alt);
+        assert_eq!(s.trigger, "alt");
+        assert_eq!(s.triggers().hold_keys(), vec![0x12]);
         assert_eq!(s.hold_ms, 1500);
     }
 

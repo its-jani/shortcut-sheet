@@ -596,7 +596,7 @@ impl eframe::App for Sheet {
             }
         }
 
-        // Ctrl-up from the hook can still arrive while we are focused.
+        // The trigger key coming up can still arrive while we are focused.
         self.drain_events(&ctx);
         self.drain_tray(&ctx);
         // And that is the whole frame. The loop used to end in an unconditional

@@ -11,6 +11,16 @@ pub enum Key {
     Alt,
     /// The Windows key.
     Win,
+    /// The spare keys a keyboard carries and almost nobody presses. They matter here because
+    /// they are what a *hold* trigger wants: a key that does nothing else can be held while
+    /// the sheet is up without leaking a character into the app behind it.
+    CapsLock,
+    NumLock,
+    ScrollLock,
+    PrintScreen,
+    Pause,
+    /// The menu key, drawn on some keyboards as a list or a context-menu glyph.
+    Apps,
     Char(char),
     Digit(u8),
     F(u8),
@@ -54,6 +64,12 @@ impl Key {
             Shift => 0x10,
             Alt => 0x12,
             Win => 0x5B,
+            CapsLock => 0x14,
+            NumLock => 0x90,
+            ScrollLock => 0x91,
+            PrintScreen => 0x2C,
+            Pause => 0x13,
+            Apps => 0x5D,
             Char(c) => match c {
                 'a'..='z' => (*c as u16) - 32,
                 'A'..='Z' => *c as u16,
@@ -103,6 +119,12 @@ impl Key {
             Shift => "Shift".into(),
             Alt => "Alt".into(),
             Win => "Win".into(),
+            CapsLock => "Caps".into(),
+            NumLock => "Num".into(),
+            ScrollLock => "Scroll".into(),
+            PrintScreen => "PrtSc".into(),
+            Pause => "Pause".into(),
+            Apps => "Menu".into(),
             Char(c) => c.to_uppercase().to_string(),
             Digit(d) => d.to_string(),
             F(n) => format!("F{n}"),
@@ -142,6 +164,12 @@ impl Key {
             "shift" => Key::Shift,
             "alt" | "option" => Key::Alt,
             "win" | "windows" | "super" | "cmd" => Key::Win,
+            "capslock" | "caps" => Key::CapsLock,
+            "numlock" | "num" => Key::NumLock,
+            "scrolllock" | "scroll" => Key::ScrollLock,
+            "printscreen" | "print" | "prtsc" | "snapshot" => Key::PrintScreen,
+            "pause" | "break" => Key::Pause,
+            "apps" | "menu" | "contextmenu" => Key::Apps,
             "enter" | "return" => Key::Enter,
             "esc" | "escape" => Key::Escape,
             "tab" => Key::Tab,
@@ -194,13 +222,42 @@ impl Key {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Combo(pub Vec<Key>);
 
+/// Which spelling a chord is being read for. The grammar is one grammar everywhere; what
+/// changes is what a chord is *allowed to be made of*, and that depends on what happens to
+/// it afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// A shortcut this app fires into another app with `SendInput`, so there has to be a key
+    /// to press: modifiers alone would inject nothing.
+    Shortcut,
+    /// The instant summon chord. Watched, never fired, so `Win+Alt` is legal - but a lone
+    /// `Ctrl` would pop the sheet over every copy-paste, so it takes two keys to be a chord.
+    Hotkey,
+    /// The key set a *hold* is measured on. Here one key is not a bug but the whole design
+    /// (`trigger: "ctrl"`), because the delay is what turns a key into a lookup. A set of
+    /// modifiers, or any key at all, is equally a trigger.
+    Trigger,
+}
+
+impl Form {
+    /// Whether a chord with no ordinary key in it is something this form can use.
+    fn modifiers_ok(self) -> bool {
+        !matches!(self, Form::Shortcut)
+    }
+
+    /// Whether one modifier on its own is enough. Only the hold, and only because of `hold_ms`.
+    fn lone_modifier_ok(self) -> bool {
+        matches!(self, Form::Trigger)
+    }
+}
+
 impl Combo {
     /// Parses `"Ctrl+Shift+Z"`. Case-insensitive, `+` separated.
     ///
     /// Fails loudly: a malformed dataset must stop startup with the offending string,
     /// not silently render an empty keycap later.
     pub fn parse(s: &str) -> Result<Self, ComboError> {
-        Self::read(s, false)
+        Self::read(s, Form::Shortcut)
     }
 
     /// Parse the chord that summons the overlay itself, where `"Win+Alt"` is legal.
@@ -211,10 +268,22 @@ impl Combo {
     /// (`StaticShortcutKeys: [91, 18]`), two modifiers and nothing else. Same token grammar,
     /// same canonical order, one rule switched off.
     pub fn parse_hotkey(s: &str) -> Result<Self, ComboError> {
-        Self::read(s, true)
+        Self::read(s, Form::Hotkey)
     }
 
-    fn read(s: &str, modifiers_ok: bool) -> Result<Self, ComboError> {
+    /// Parse the key set a hold is measured on, where `"ctrl"` is the stock answer and
+    /// `"f6"`, `"capslock"` or `"ctrl+shift"` are the customised ones.
+    ///
+    /// The instant chord's grammar with its two-key minimum removed: a hold is not a chord the
+    /// user taps on the way to something else, it is a key they deliberately keep down for
+    /// `hold_ms`, and one key is the common case. Everything else still applies - unknown
+    /// tokens fail, and so does a set with two ordinary keys in it, which is a sequence
+    /// nobody can hold.
+    pub fn parse_trigger(s: &str) -> Result<Self, ComboError> {
+        Self::read(s, Form::Trigger)
+    }
+
+    fn read(s: &str, form: Form) -> Result<Self, ComboError> {
         let mut keys = Vec::new();
         for tok in s.split('+') {
             let tok = tok.trim();
@@ -227,12 +296,18 @@ impl Combo {
                 combo: s.to_string(),
                 token: tok.to_string(),
             })?;
-            keys.push(k);
+            // A key written twice is one key pressed once. This matters more than tidiness:
+            // the hook watches a set it either has or has not seen complete, so a duplicate
+            // left in a trigger would be a key that can never come down twice at once - a
+            // trigger that silently never fires, from a settings file that looks reasonable.
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
         }
         if keys.is_empty() {
             return Err(ComboError::Empty(s.to_string()));
         }
-        if !modifiers_ok && keys.iter().all(Key::is_modifier) {
+        if !form.modifiers_ok() && keys.iter().all(Key::is_modifier) {
             return Err(ComboError::ModifiersOnly(s.to_string()));
         }
         // A chord like Ctrl+K,S is two presses in sequence, not one simultaneous press.
@@ -243,7 +318,7 @@ impl Combo {
         if keys.iter().filter(|k| !k.is_modifier()).count() > 1 {
             return Err(ComboError::NotAChord(s.to_string()));
         }
-        if keys.iter().all(Key::is_modifier) && keys.len() < 2 {
+        if !form.lone_modifier_ok() && keys.iter().all(Key::is_modifier) && keys.len() < 2 {
             // A one-key hotkey (`"Ctrl"`) is the hold mode with the delay taken to zero: it
             // would summon the sheet on every press of a key the user types hundreds of times
             // a day. Two keys minimum is what makes an instant chord a chord.
@@ -377,6 +452,103 @@ mod tests {
         // The settings file is hand-edited, so the error has to say which value is at fault.
         let err = Combo::parse_hotkey("Win+Banan").unwrap_err();
         assert!(err.to_string().contains("Banan"), "{err}");
+    }
+
+    // -- the hold trigger -----------------------------------------------------------------
+
+    #[test]
+    fn a_lone_modifier_is_a_trigger_even_though_it_is_not_a_chord() {
+        // The stock configuration, which is what `"trigger": "ctrl"` has always meant. The
+        // two other forms refuse it for good reasons; the hold is the case those reasons
+        // do not apply to, because the delay is what makes it deliberate.
+        assert_eq!(Combo::parse_trigger("ctrl").unwrap().0, vec![Key::Ctrl]);
+        assert_eq!(Combo::parse_trigger("ALT").unwrap().0, vec![Key::Alt]);
+    }
+
+    #[test]
+    fn any_key_at_all_can_be_a_trigger() {
+        // The whole feature: the hold is not limited to the four modifiers. Function keys,
+        // the spare keys nobody else uses, and punctuation all work, spelled the way every
+        // other chord in this project spells them.
+        assert_eq!(Combo::parse_trigger("f13").unwrap().0, vec![Key::F(13)]);
+        assert_eq!(Combo::parse_trigger("capslock").unwrap().0, vec![Key::CapsLock]);
+        assert_eq!(Combo::parse_trigger("`").unwrap().0, vec![Key::Grave]);
+        assert_eq!(Combo::parse_trigger("menu").unwrap().0, vec![Key::Apps]);
+    }
+
+    #[test]
+    fn a_trigger_may_be_a_set_of_keys_held_together() {
+        // "Hold Ctrl+Shift for a second and a half" is a trigger a one-key hook could not
+        // offer, and it reads the way the instant chord reads. Canonical order, so
+        // "shift+ctrl" and "ctrl+shift" are the same instruction.
+        let t = Combo::parse_trigger("shift+ctrl").unwrap();
+        assert_eq!(t.0, vec![Key::Ctrl, Key::Shift]);
+        assert_eq!(t, Combo::parse_trigger("Ctrl+Shift").unwrap());
+        // ...including a full shortcut, which is a key set like any other to hold down.
+        assert_eq!(
+            Combo::parse_trigger("Ctrl+Shift+P").unwrap().0,
+            vec![Key::Ctrl, Key::Shift, Key::Char('p')]
+        );
+    }
+
+    #[test]
+    fn a_trigger_keeps_the_rules_that_protect_it_from_itself() {
+        // Two ordinary keys are a sequence, not a gesture, and an unknown word is a typo in a
+        // hand-edited file. Both answers are the ones the instant chord gives.
+        assert!(matches!(
+            Combo::parse_trigger("K+S").unwrap_err(),
+            ComboError::NotAChord(_)
+        ));
+        assert!(matches!(
+            Combo::parse_trigger("Banan").unwrap_err(),
+            ComboError::Unknown { .. }
+        ));
+        assert!(Combo::parse_trigger("").is_err());
+    }
+
+    #[test]
+    fn the_spare_keys_are_known_by_every_name_people_use() {
+        for (spelling, key) in [
+            ("caps", Key::CapsLock),
+            ("capslock", Key::CapsLock),
+            ("numlock", Key::NumLock),
+            ("scroll", Key::ScrollLock),
+            ("prtsc", Key::PrintScreen),
+            ("printscreen", Key::PrintScreen),
+            ("pause", Key::Pause),
+            ("apps", Key::Apps),
+            ("menu", Key::Apps),
+        ] {
+            assert_eq!(Key::parse_token(spelling), Some(key), "'{spelling}'");
+        }
+    }
+
+    #[test]
+    fn the_spare_keys_have_the_windows_vk_codes_and_short_labels() {
+        // Labels go inside a keycap, so they have to stay narrow; the codes are what the hook
+        // and SendInput match on.
+        assert_eq!(Key::CapsLock.vk(), 0x14);
+        assert_eq!(Key::NumLock.vk(), 0x90);
+        assert_eq!(Key::ScrollLock.vk(), 0x91);
+        assert_eq!(Key::PrintScreen.vk(), 0x2C);
+        assert_eq!(Key::Pause.vk(), 0x13);
+        assert_eq!(Key::Apps.vk(), 0x5D);
+        assert_eq!(Key::CapsLock.label(), "Caps");
+        assert_eq!(Key::PrintScreen.label(), "PrtSc");
+        // And none of them is a modifier: CapsLock held down is still a key of its own.
+        assert!(!Key::CapsLock.is_modifier());
+    }
+
+    #[test]
+    fn a_key_written_twice_is_one_key_pressed_once() {
+        // A typo in the hand-edited settings file must not become a dead trigger, and must not
+        // become a modifier pressed twice on the way into an app either.
+        assert_eq!(Combo::parse_trigger("ctrl+ctrl").unwrap().0, vec![Key::Ctrl]);
+        assert_eq!(Combo::parse("Ctrl+Ctrl+C").unwrap().0, vec![Key::Ctrl, Key::Char('c')]);
+        assert_eq!(Combo::parse_hotkey("Win+Alt+Win").unwrap().0, vec![Key::Win, Key::Alt]);
+        // And the deduplication happens before the two-key rules, so a doubled ordinary key is
+        // one key held down, not a sequence nobody can press.
+        assert_eq!(Combo::parse_trigger("K+K").unwrap().0, vec![Key::Char('k')]);
     }
 
     #[test]
