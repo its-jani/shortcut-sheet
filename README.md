@@ -2,10 +2,11 @@
 
 **Hold a key, see the shortcuts for the app you are in — and fire one without leaving it.**
 
-A clean-room, open-source Windows desktop utility. Hold `Ctrl` (configurable) for a moment
-in any supported app and a focusless cheat-sheet overlay appears centered on that app's
-window. Click or search a command and the real key combo is injected back into the app you
-were already using. Release the key and the overlay is gone — your focus never moved.
+A clean-room, open-source Windows desktop utility. Hold `Ctrl` — or any key you name, from
+`F13` to `Caps` to `Ctrl+Shift` — for a moment in any supported app and a focusless cheat-sheet
+overlay appears centered on that app's window. Click or search a command and the real key combo
+is injected back into the app you were already using. Release the key and the overlay is gone —
+your focus never moved.
 
 Written fresh in pure Rust. It is **not** a fork, rebrand, or port of any commercial
 shortcut app; only factual key mappings (which combo does what) are reused, and those are
@@ -32,11 +33,13 @@ text field.
 
 Implemented:
 
-- **Two trigger modes**, watched by one global low-level keyboard hook that rejects injected
-  input (`LLMHF_INJECTED`), so the app's own fired combos never re-trigger it. A **long press**
-  of a configurable key for a configurable delay, and an **instant chord** (`Win+Alt` by
-  default, either or both switchable off). The hook proc does no allocation, no locking and no
-  I/O to stay well under Windows' `LowLevelHooksTimeout`.
+- **Two trigger modes, on any keys you like**, watched by one global low-level keyboard hook
+  that rejects injected input (`LLMHF_INJECTED`), so the app's own fired combos never re-trigger
+  it. A **long press** of any key — or any set of keys held together — for a configurable delay,
+  and an **instant chord** (`Win+Alt` by default, either or both switchable off). Left and right
+  Ctrl/Alt/Shift/Win are one trigger, not two. The hook proc does no allocation, no locking and
+  no I/O to stay well under Windows' `LowLevelHooksTimeout`. See [Choosing a
+  trigger](#choosing-a-trigger).
 - **Foreground-app detection** — maps the active process image name (e.g. `Code.exe`,
   `chrome.exe`) to a shortcut profile, and a name on the roster to a panel that says so. A
   recognised app with no rows is a different answer from an unknown one, and gets one.
@@ -51,7 +54,8 @@ Implemented:
 - **Progress recording** — firing a command marks it "learnt" in a per-(app, collection)
   store that survives restarts and app renames.
 - **Tray icon** with a Quit menu — the app's only shell presence (the overlay has no taskbar
-  entry).
+  entry). Its tooltip names the key your settings actually chose, not the one this build
+  shipped with.
 - **Hand-editable dataset** — user JSON files merge over the compiled-in catalog; entries
   override by command name and `"removed": true` tombstones delete them.
 - **Rolling file logging** — this exe has no console, so diagnostics go to
@@ -74,7 +78,8 @@ cargo build --release
 target\release\shortcut-sheet.exe
 ```
 
-Hold `Ctrl` in a supported app to bring up the overlay. Right-click the tray icon to quit.
+Hold `Ctrl` in a supported app to bring up the overlay — or whatever key `trigger` names, if
+you have edited `settings.json`. Right-click the tray icon to quit.
 
 For development:
 
@@ -128,11 +133,49 @@ that one setting rather than the app:
 }
 ```
 
-The two trigger modes are independent. `long_press_enabled` is the hold: `trigger` down for
-`hold_ms` with nothing else pressed. `instant_enabled` is the chord: `instant_hotkey` pressed
-together, no delay, and the sheet stays up until it is dismissed — Escape, a fired row, a
-second press of the chord, or clicking away. A chord has to be at least two keys, because a
-bare `Ctrl` as an instant trigger would pop the sheet over every copy-paste.
+The two trigger modes are independent. `long_press_enabled` is the hold: `trigger` — one key or
+a set — down for `hold_ms` with nothing else pressed. `instant_enabled` is the chord:
+`instant_hotkey` pressed together, no delay, and the sheet stays up until it is dismissed —
+Escape, a fired row, a second press of the chord, or clicking away. A chord has to be at least
+two keys, because a bare `Ctrl` as an instant trigger would pop the sheet over every
+copy-paste.
+
+### Choosing a trigger
+
+`trigger` is any key this build can name, spelled the way every shortcut in the dataset is
+spelled: case-insensitive, `+` between keys, the same words as the keycaps. One key is the
+normal answer; a set of keys held together is legal too.
+
+| `trigger` | means |
+| --- | --- |
+| `"ctrl"` | hold Ctrl — the default, either side of the board |
+| `"alt"`, `"shift"`, `"win"` | any other modifier (`super`, `cmd`, `control`, `option` are accepted spellings) |
+| `"f13"`, `"caps"`, `"prtsc"`, `"pause"`, `"menu"` | a function key, or one of the spare keys nobody else uses |
+| `"grave"`, `"comma"`, `"slash"`, `"'"` | punctuation — by name, or by the glyph on the key |
+| `"space"`, `"tab"`, `"esc"`, `"up"` | the ordinary keys, including the navigation cluster |
+| `"ctrl+shift"` | hold both at once — the sheet comes up when the last one lands |
+| `"ctrl+shift+p"` | hold a whole shortcut, if that is the gesture you want |
+
+Both modes read the same key stream, and a completed instant chord always wins over a hold in
+progress, so `"trigger": "ctrl"` beside `"instant_hotkey": "Ctrl+Shift+P"` behaves the way you
+would hope: Ctrl alone looks something up, Ctrl+Shift+P summons at once.
+
+Four things worth knowing before you pick:
+
+- **Keys are watched, never swallowed.** The hook does not eat your trigger key, so a key that
+  types or toggles keeps doing that while you hold it. That is why a modifier, a high function
+  key or a spare key makes a good trigger, and why `"trigger": "a"` would write `aaa` into your
+  document until the sheet appears.
+- **Either side of the board is the same key.** The hook folds `VK_LCONTROL`, `VK_RMENU` and
+  their siblings onto the generic code before the rules run, so a right-handed Ctrl counts.
+- **A typo costs one setting, not the app.** A `trigger` this build cannot read turns the hold
+  mode off and says so in the log; it never substitutes Ctrl for the key you asked for, and it
+  leaves the instant chord alone. Same for `instant_hotkey`. If both come out off, the app still
+  runs with a tray icon and says why once in the log.
+- **The tooltip follows the setting.** Both modes resolve once at startup, and the hook and the
+  tray tooltip read the same answer, so the sentence over the icon cannot name a key that does
+  nothing. `--peek` still works whatever the trigger is, and
+  `%LOCALAPPDATA%\shortcut-sheet\logs` records the codes the hook was told to watch.
 
 A user shortcut file (`apps/myapp.json`) that adds or edits commands. `aliases` are extra
 names the same command goes by, and the search matches them the way it matches `command`:
@@ -162,8 +205,8 @@ Rules that keep a background utility alive:
 - Only the **compiled-in** dataset can abort startup (a typo there is a bug, caught by
   `cargo test`). Anything the user owns is **degraded, not fatal**: a mistyped chord in a
   user file drops that one row and keeps the working shortcut it would have replaced; an
-  unreadable `settings.json` or damaged progress file falls back to defaults. All skips are
-  logged.
+  unreadable `settings.json` or damaged progress file falls back to defaults; a trigger key
+  this build cannot name turns that one trigger mode off. All skips are logged.
 - A damaged or half-written file never makes the app vanish on next launch.
 
 The built-in dataset ships 26 profiles with rows across eight categories, and a roster of 64
@@ -229,10 +272,15 @@ cargo test
 
 Coverage focuses on the risky parts: the trigger state machine (bare hold shows exactly at the
 threshold, a tap never shows, typing a real shortcut disarms, autorepeat doesn't re-arm, a
-completed instant chord shows with no delay and no key release hides it), combo and hotkey
-parsing and release order, foreground-app resolution across both shelves of the dataset,
-search ranking over labels *and* aliases, the row index that Enter fires and records as one
-invariant, and the store's degrade-don't-fail behaviour when user files are damaged.
+completed instant chord shows with no delay and no key release hides it, and the same rules for
+a hold measured on a *set* of keys — it arms only when the last key lands, its own keys never
+cancel it, and letting go of any one of them ends the session), key-name parsing for the three
+things a name is used for (a chord we fire, a chord we watch, a set we hold), left/right
+modifier codes folding onto one key, combo and hotkey parsing and release order,
+foreground-app resolution across both shelves of the dataset, search ranking over labels *and*
+aliases, the row index that Enter fires and records as one invariant, the tray tooltip agreeing
+with the keys the hook was handed, and the store's degrade-don't-fail behaviour when user files
+are damaged.
 
 ## License
 
